@@ -1,6 +1,6 @@
-# ALVR Cloud — Dynamic Foveated Rendering Research Fork
+# ALVR — Dynamic Foveated Rendering Fork
 
-This repository is an experimental research fork of [ALVR](https://github.com/alvr-org/ALVR), focused primarily on eye-tracked dynamic foveated rendering (DFR).
+This repository is an experimental fork of [ALVR](https://github.com/alvr-org/ALVR), focused primarily on eye-tracked dynamic foveated rendering (DFR).
 
 It is not a current upstream ALVR release and should not be expected to be compatible with the latest upstream code or headset runtimes.
 
@@ -12,7 +12,7 @@ The code lineage starts from the official ALVR `master` branch at commit [`1f0ba
 
 The first local development snapshot was created directly on top of that upstream commit. This repository therefore represents an older ALVR baseline, not a fork of the current upstream tip.
 
-The public history intentionally contains only two source-focused commits: the DFR implementation and the later telemetry/data-collection additions. Intermediate experiment commits and private research materials are not included.
+The public history intentionally contains only two source-focused commits: the DFR implementation and the later telemetry/data-collection additions. Intermediate experiment commits and private materials are not included.
 
 ## Main contribution
 
@@ -39,7 +39,7 @@ The branch also contains exploratory telemetry and motion-prediction work from l
 
 This is a reference implementation and an invitation for further development. The original developer currently has no VR headset available for continued hardware validation or maintenance. Porting the DFR changes to a current upstream ALVR revision, validating them on modern headsets, and preparing an upstream contribution will require community help.
 
-Use this repository to inspect the implementation, reproduce the research direction, or extract individual ideas for upstream integration. Expect substantial work when adapting it to current ALVR APIs, protocols, graphics code, and headset runtimes.
+Use this repository to inspect the implementation, reproduce the development direction, or extract individual ideas for upstream integration. Expect substantial work when adapting it to current ALVR APIs, protocols, graphics code, and headset runtimes.
 
 ## Building
 
