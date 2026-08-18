@@ -230,6 +230,7 @@ impl ClientCoreContext {
         mut device_motions: Vec<(u64, DeviceMotion)>,
         hand_skeletons: [Option<[Pose; 26]>; 2],
         face_data: FaceData,
+        wifi_metrics: Option<alvr_packets::WiFiMetrics>,
     ) {
         dbg_client_core!("send_tracking");
 
@@ -245,6 +246,13 @@ impl ClientCoreContext {
 
         // Guarantee that sent timestamps never go backwards by sending the poll time
         let reported_timestamp = poll_timestamp;
+
+        // Save raw HEAD motion before linear extrapolation prediction
+        // This allows telemetry to compare actual vs predicted poses
+        let raw_head_motion = device_motions
+            .iter()
+            .find(|(id, _)| *id == *HEAD_ID)
+            .map(|(_, m)| *m);
 
         for (id, motion) in &mut device_motions {
             let velocity_multiplier = *self.connection_context.velocities_multiplier.read();
@@ -307,6 +315,8 @@ impl ClientCoreContext {
                     device_motions,
                     hand_skeletons,
                     face_data,
+                    wifi_metrics,
+                    raw_head_motion,
                 })
                 .ok();
 
@@ -403,16 +413,27 @@ impl ClientCoreContext {
         let cache_guard = self.connection_context.frame_shift_cache.read();
         if let Some(cached_data) = cache_guard.get(&timestamp) {
             if let Some(shift_data) = cached_data {
-                alvr_common::debug!("🎯 CLIENT_FRAME_PERFECT: Retrieved DFR shift [ts={:?}, seq={}] ({:.3},{:.3})",
-                                  timestamp, shift_data.sequence_id, shift_data.shift_x, shift_data.shift_y);
+                alvr_common::debug!(
+                    "🎯 CLIENT_FRAME_PERFECT: Retrieved DFR shift [ts={:?}, seq={}] ({:.3},{:.3})",
+                    timestamp,
+                    shift_data.sequence_id,
+                    shift_data.shift_x,
+                    shift_data.shift_y
+                );
                 return Some(*shift_data);
             } else {
-                alvr_common::debug!("🎯 CLIENT_FRAME_PERFECT: Using FFR mode [ts={:?}]", timestamp);
+                alvr_common::debug!(
+                    "🎯 CLIENT_FRAME_PERFECT: Using FFR mode [ts={:?}]",
+                    timestamp
+                );
                 return None;
             }
         } else {
-            alvr_common::warn!("🎯 CLIENT_FRAME_PERFECT: No shift data found for timestamp {:?}, cache size: {}",
-                             timestamp, cache_guard.len());
+            alvr_common::warn!(
+                "🎯 CLIENT_FRAME_PERFECT: No shift data found for timestamp {:?}, cache size: {}",
+                timestamp,
+                cache_guard.len()
+            );
         }
         None
     }

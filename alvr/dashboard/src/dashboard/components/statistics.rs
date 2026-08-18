@@ -48,13 +48,14 @@ impl StatisticsTab {
             ScrollArea::new([false, true]).show(ui, |ui| {
                 let available_width = ui.available_width();
                 self.draw_latency_graph(ui, available_width);
+                self.draw_mtp_graph(ui, available_width);
                 self.draw_fps_graph(ui, available_width);
                 self.draw_bitrate_graph(ui, available_width);
                 self.draw_statistics_overview(ui, stats);
             });
         } else {
             ui.heading(
-                "No statistics available. 
+                "No statistics available.
             Start SteamVR and connect to a device to gather statistics",
             );
         }
@@ -210,6 +211,79 @@ impl StatisticsTab {
                         ui,
                         "Game Render (not ALVR latency)",
                         stats.game_time_s,
+                        RENDER_EXTERNAL_LABEL,
+                    );
+                });
+            },
+        );
+    }
+
+    fn draw_mtp_graph(&self, ui: &mut Ui, available_width: f32) {
+        let mut data = statistics::Data::new(
+            self.history
+                .iter()
+                .map(|stats| stats.total_pipeline_latency_s as f64)
+                .collect::<Vec<_>>(),
+        );
+
+        self.draw_graph(
+            ui,
+            available_width,
+            "Motion to Photon (MTP) Latency",
+            0.0..=(data.quantile(UPPER_QUANTILE) * 1.2) as f32 * 1000.0,
+            |painter, to_screen_trans| {
+                for i in 0..GRAPH_HISTORY_SIZE {
+                    let stats = &self.history[i];
+                    let mut offset = 0.0;
+                    // MTP = sum of all 8 layers from tracking to photon
+                    for (value, color) in &[
+                        (stats.game_time_s, graph_colors::RENDER_EXTERNAL),
+                        (stats.server_compositor_s, graph_colors::RENDER),
+                        (stats.encoder_s, graph_colors::TRANSCODE),
+                        (stats.network_s, graph_colors::NETWORK),
+                        (stats.decoder_s, graph_colors::TRANSCODE),
+                        (stats.decoder_queue_s, graph_colors::IDLE),
+                        (stats.client_compositor_s, graph_colors::RENDER),
+                        (stats.vsync_queue_s, graph_colors::RENDER_EXTERNAL),
+                    ] {
+                        painter.rect_filled(
+                            Rect {
+                                min: to_screen_trans * pos2(i as f32, offset + value * 1000.0),
+                                max: to_screen_trans * pos2(i as f32 + 2.0, offset),
+                            },
+                            CornerRadius::ZERO,
+                            *color,
+                        );
+                        offset += value * 1000.0;
+                    }
+                }
+            },
+            |ui, stats| {
+                use graph_colors::*;
+
+                Grid::new("mtp_tooltip").num_columns(2).show(ui, |ui| {
+                    fn label(ui: &mut Ui, text: &str, value_s: f32, color: Color32) {
+                        ui.colored_label(color, text);
+                        ui.colored_label(color, format!("{:.2}ms", value_s * 1000.0));
+                        ui.end_row();
+                    }
+
+                    label(ui, "Total MTP", stats.total_pipeline_latency_s, theme::FG);
+                    ui.separator();
+                    ui.end_row();
+
+                    // MTP decomposition: 8 layers
+                    label(ui, "Game Render", stats.game_time_s, RENDER_EXTERNAL_LABEL);
+                    label(ui, "Server Compositor", stats.server_compositor_s, RENDER);
+                    label(ui, "Encode", stats.encoder_s, TRANSCODE);
+                    label(ui, "Network", stats.network_s, NETWORK);
+                    label(ui, "Decode", stats.decoder_s, TRANSCODE);
+                    label(ui, "Decoder Queue", stats.decoder_queue_s, IDLE);
+                    label(ui, "Client Compositor", stats.client_compositor_s, RENDER);
+                    label(
+                        ui,
+                        "VSync Queue",
+                        stats.vsync_queue_s,
                         RENDER_EXTERNAL_LABEL,
                     );
                 });

@@ -239,10 +239,13 @@ async fn http_api(
                             .send(ServerCoreEvent::RequestIDR)
                             .ok();
                     }
-                    ServerRequest::StartRecording => crate::create_recording_file(
-                        connection_context,
-                        crate::SESSION_MANAGER.read().settings(),
-                    ),
+                    ServerRequest::StartRecording => {
+                        crate::create_recording_file(
+                            &connection_context,
+                            crate::SESSION_MANAGER.read().settings(),
+                            None,
+                        );
+                    }
                     ServerRequest::StopRecording => {
                         *connection_context.video_recording_file.lock() = None
                     }

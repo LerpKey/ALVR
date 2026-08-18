@@ -28,27 +28,28 @@ use alvr_common::{
 use alvr_events::{EventType, HapticsEvent};
 use alvr_filesystem as afs;
 use alvr_packets::{
-    BatteryInfo, ButtonEntry, ClientListAction, DecoderInitializationConfig, DFRShiftData, Haptics,
+    BatteryInfo, ButtonEntry, ClientListAction, DFRShiftData, DecoderInitializationConfig, Haptics,
     VideoPacketHeader,
 };
 use alvr_server_io::ServerSessionManager;
 use alvr_session::{CodecType, OpenvrProperty, Settings};
 use alvr_sockets::StreamSender;
 use bitrate::{BitrateManager, DynamicEncoderParams};
-use statistics::StatisticsManager;
+use statistics::{DatasetSessionMetadata, StatisticsManager};
 use std::{
     collections::HashSet,
     env,
     ffi::OsStr,
-    fs::File,
+    fs::{self, File, OpenOptions},
     io::Write,
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, SyncSender, TrySendError},
         Arc, OnceLock,
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{runtime::Runtime, sync::broadcast};
 use tracking::TrackingManager;
@@ -108,16 +109,167 @@ pub struct ConnectionContext {
     decoder_config: Mutex<Option<DecoderInitializationConfig>>,
     video_mirror_sender: Mutex<Option<broadcast::Sender<Vec<u8>>>>,
     video_recording_file: Mutex<Option<File>>,
+    dataset_video_state: Mutex<Option<DatasetVideoState>>,
     connection_threads: Mutex<Vec<JoinHandle<()>>>,
     clients_to_be_removed: Mutex<HashSet<String>>,
     video_channel_sender: Mutex<Option<SyncSender<VideoPacket>>>,
     haptics_sender: Mutex<Option<StreamSender<Haptics>>>,
 }
 
-impl ConnectionContext {
+struct DatasetVideoState {
+    metadata: DatasetSessionMetadata,
+    current_file: Option<File>,
+    segment_start_instant: Option<Instant>,
+    segment_start_ms: Option<u64>,
+    current_file_name: Option<String>,
+    current_file_path: Option<PathBuf>,
 }
 
-pub fn create_recording_file(connection_context: &ConnectionContext, settings: &Settings) {
+impl DatasetVideoState {
+    fn new(metadata: DatasetSessionMetadata) -> Self {
+        Self {
+            metadata,
+            current_file: None,
+            segment_start_instant: None,
+            segment_start_ms: None,
+            current_file_name: None,
+            current_file_path: None,
+        }
+    }
+
+    fn write_packet(
+        &mut self,
+        decoder_config: &Mutex<Option<DecoderInitializationConfig>>,
+        nal_buffer: &[u8],
+        is_idr: bool,
+    ) {
+        let elapsed = self.segment_start_instant.map(|start| start.elapsed());
+        let needs_new_segment = match (self.current_file.is_some(), elapsed) {
+            (false, _) => is_idr,
+            (true, Some(elapsed)) => elapsed >= self.metadata.video_segment_duration && is_idr,
+            (true, None) => is_idr,
+        };
+
+        if needs_new_segment {
+            if let Err(err) = self.open_new_segment(decoder_config) {
+                alvr_common::warn!("Failed to open dataset video segment: {err}");
+                return;
+            }
+        } else if self.current_file.is_none() {
+            return;
+        }
+
+        if let Some(file) = &mut self.current_file {
+            let _ = file.write_all(nal_buffer);
+        }
+    }
+
+    fn open_new_segment(
+        &mut self,
+        decoder_config: &Mutex<Option<DecoderInitializationConfig>>,
+    ) -> std::io::Result<()> {
+        self.close_current_file();
+        let start_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|_| Duration::ZERO)
+            .as_millis() as u64;
+        let duration_hint_ms = self.metadata.video_segment_duration.as_millis() as u64;
+        let file_name = format!("video_{start_ms}_{duration_hint_ms}.h264");
+        let path = self.metadata.session_dir.join(&file_name);
+        let mut file = File::create(&path)?;
+        if let Some(config) = &*decoder_config.lock() {
+            file.write_all(&config.config_buffer).ok();
+        }
+        self.segment_start_instant = Some(Instant::now());
+        self.segment_start_ms = Some(start_ms);
+        self.current_file_name = Some(file_name);
+        self.current_file_path = Some(path);
+        self.current_file = Some(file);
+        Ok(())
+    }
+
+    fn close_current_file(&mut self) {
+        if let Some(mut file) = self.current_file.take() {
+            use std::io::Write;
+            let _ = file.flush();
+            drop(file);
+            let start_instant = self.segment_start_instant.take();
+            let start_ms = self.segment_start_ms.take();
+            let name_opt = self.current_file_name.take();
+            let path_opt = self.current_file_path.take();
+            if let (Some(start_instant), Some(start_ms), Some(mut name)) =
+                (start_instant, start_ms, name_opt)
+            {
+                let duration_ms = start_instant.elapsed().as_millis().max(1) as u64;
+                if let Some(path) = path_opt {
+                    let actual_name = format!("video_{start_ms}_{duration_ms}.h264");
+                    if actual_name != name {
+                        let new_path = self.metadata.session_dir.join(&actual_name);
+                        if let Err(err) = fs::rename(&path, &new_path) {
+                            alvr_common::warn!(
+                                "Failed to rename dataset video {name} -> {actual_name}: {err}"
+                            );
+                        } else {
+                            name = actual_name;
+                        }
+                    }
+                }
+                self.append_manifest(&name, start_ms, duration_ms);
+            }
+        }
+        self.segment_start_instant = None;
+        self.segment_start_ms = None;
+        self.current_file_name = None;
+        self.current_file_path = None;
+    }
+
+    fn append_manifest(&self, file_name: &str, start_ms: u64, duration_ms: u64) {
+        if let Ok(mut manifest) = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&self.metadata.video_manifest_path)
+        {
+            let _ = writeln!(manifest, "{file_name},{start_ms},{duration_ms}");
+        }
+    }
+}
+
+impl Drop for DatasetVideoState {
+    fn drop(&mut self) {
+        // Ensure the last segment is flushed even if the caller forgets to finalize explicitly.
+        self.close_current_file();
+    }
+}
+
+impl ConnectionContext {
+    pub fn init_dataset_video(&self, metadata: DatasetSessionMetadata) {
+        let mut lock = self.dataset_video_state.lock();
+        if let Some(state) = lock.as_mut() {
+            state.close_current_file();
+        }
+        *lock = Some(DatasetVideoState::new(metadata));
+    }
+
+    pub fn finalize_dataset_video(&self) {
+        let mut lock = self.dataset_video_state.lock();
+        if let Some(state) = lock.as_mut() {
+            state.close_current_file();
+        }
+        *lock = None;
+    }
+
+    fn write_dataset_video_packet(&self, nal_buffer: &[u8], is_idr: bool) {
+        if let Some(state) = &mut *self.dataset_video_state.lock() {
+            state.write_packet(&self.decoder_config, nal_buffer, is_idr);
+        }
+    }
+}
+
+pub fn create_recording_file(
+    connection_context: &ConnectionContext,
+    settings: &Settings,
+    path_maybe: Option<PathBuf>,
+) {
     let codec = settings.video.preferred_codec;
     let ext = match codec {
         CodecType::H264 => "h264",
@@ -125,10 +277,12 @@ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &
         CodecType::AV1 => "av1",
     };
 
-    let path = FILESYSTEM_LAYOUT.get().unwrap().log_dir.join(format!(
-        "recording.{}.{ext}",
-        chrono::Local::now().format("%F.%H-%M-%S")
-    ));
+    let path = path_maybe.unwrap_or_else(|| {
+        FILESYSTEM_LAYOUT.get().unwrap().log_dir.join(format!(
+            "recording.{}.{ext}",
+            chrono::Local::now().format("%F.%H-%M-%S")
+        ))
+    });
 
     match File::create(path) {
         Ok(mut file) => {
@@ -203,7 +357,7 @@ impl ServerCoreContext {
         // Create a temporary StatisticsManager until a headset connects
         let initial_settings = SESSION_MANAGER.read().settings().clone();
         let stats = StatisticsManager::new(
-            initial_settings.connection.statistics_history_size,
+            &initial_settings,
             Duration::from_secs_f32(1.0 / 90.0),
             if let Switch::Enabled(config) = &initial_settings.headset.controllers {
                 config.steamvr_pipeline_frames
@@ -222,6 +376,7 @@ impl ServerCoreContext {
             decoder_config: Mutex::new(None),
             video_mirror_sender: Mutex::new(None),
             video_recording_file: Mutex::new(None),
+            dataset_video_state: Mutex::new(None),
             connection_threads: Mutex::new(Vec::new()),
             clients_to_be_removed: Mutex::new(HashSet::new()),
             video_channel_sender: Mutex::new(None),
@@ -397,7 +552,9 @@ impl ServerCoreContext {
                         create_recording_file(
                             &self.connection_context,
                             SESSION_MANAGER.read().settings(),
+                            None,
                         );
+
                         *LAST_IDR_INSTANT.lock() = Instant::now();
                     }
                 }
@@ -418,35 +575,47 @@ impl ServerCoreContext {
                     file.write_all(&nal_buffer).ok();
                 }
 
+                self.connection_context
+                    .write_dataset_video_packet(&nal_buffer, is_idr);
+
                 // 🎯 使用统一时间戳生成器：基于SteamVR的精确targetTimestampNs检索shift数据
                 // 确保传输的shift与编码时使用的shift完全相同（同一时间戳绑定）
                 let target_timestamp_ns = target_timestamp.as_nanos() as u64;
-                let dfr_shift = eye_tracked_ffr::get_dfr_shift_for_timestamp(target_timestamp_ns).map(|shift| {
-                    let sequence_id = eye_tracked_ffr::get_synchronized_sequence_id();
+                let dfr_shift = if target_timestamp_ns == 0 {
+                    None
+                } else {
+                    eye_tracked_ffr::get_dfr_shift_for_timestamp(target_timestamp_ns).map(|shift| {
+                        let sequence_id = eye_tracked_ffr::get_synchronized_sequence_id();
 
-                    // 调试日志：验证统一时间戳绑定
-                    if shift.is_eye_tracked {
-                        alvr_common::debug!("🎯 UNIFIED_TIMESTAMP: Using cached DFR shift [seq={}, ts={}] ({:.3},{:.3}) for video packet",
-                                          sequence_id, target_timestamp_ns, shift.shift_x, shift.shift_y);
-                    } else {
-                        alvr_common::debug!("🎯 UNIFIED_TIMESTAMP: Using cached FFR default [seq={}, ts={}] for video packet",
-                                          sequence_id, target_timestamp_ns);
-                    }
+                        // 🎯 使用统一时间戳生成器：基于SteamVR的精确targetTimestampNs检索shift数据
+                        if shift.is_eye_tracked {
+                            alvr_common::debug!("🎯 UNIFIED_TIMESTAMP: Using cached DFR shift [seq={}, ts={}] ({:.3},{:.3}) for video packet",
+                                              sequence_id, target_timestamp_ns, shift.shift_x, shift.shift_y);
+                        } else {
+                            alvr_common::debug!("🎯 UNIFIED_TIMESTAMP: Using cached FFR default [seq={}, ts={}] for video packet",
+                                              sequence_id, target_timestamp_ns);
+                        }
 
-                    DFRShiftData {
-                        shift_x: shift.shift_x,
-                        shift_y: shift.shift_y,
-                        sequence_id,
-                        is_eye_tracked: shift.is_eye_tracked,
-                    }
-                });
+                        // 传递数据给renderer
+                        DFRShiftData {
+                            shift_x: shift.shift_x,
+                            shift_y: shift.shift_y,
+                            left_shift_x: shift.left_shift_x,
+                            left_shift_y: shift.left_shift_y,
+                            right_shift_x: shift.right_shift_x,
+                            right_shift_y: shift.right_shift_y,
+                            sequence_id,
+                            is_eye_tracked: shift.is_eye_tracked,
+                        }
+                    })
+                };
 
                 if matches!(
                     sender.try_send(VideoPacket {
                         header: VideoPacketHeader {
                             timestamp: target_timestamp,
                             is_idr,
-                            dfr_shift,  // 🎯 统一时间戳绑定的eyeshift数据
+                            dfr_shift, // 🎯 统一时间戳绑定的eyeshift数据
                         },
                         payload: nal_buffer,
                     }),
@@ -464,7 +633,8 @@ impl ServerCoreContext {
             }
 
             if let Some(stats) = &mut *self.connection_context.statistics_manager.write() {
-                let encoder_latency = stats.report_frame_encoded(target_timestamp, buffer_size);
+                let encoder_latency =
+                    stats.report_frame_encoded(target_timestamp, buffer_size, is_idr);
 
                 self.connection_context
                     .bitrate_manager

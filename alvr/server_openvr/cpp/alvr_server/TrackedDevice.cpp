@@ -84,20 +84,29 @@ void TrackedDevice::submit_pose(vr::DriverPose_t pose) {
 }
 
 bool TrackedDevice::register_device() {
+    const auto serial_number = this->get_serial_number();
+
     if (!vr::VRServerDriverHost()->TrackedDeviceAdded(
-            this->get_serial_number().c_str(),
+            serial_number.c_str(),
             this->device_class,
             (vr::ITrackedDeviceServerDriver*)this
         )) {
-        Error("Failed to register device (%s)", this->get_serial_number().c_str());
+        Error("Failed to register device (%s)", serial_number.c_str());
 
         return false;
     }
 
     auto lock = std::unique_lock<std::mutex>(this->activation_mutex);
-    this->activation_condvar.wait_for(lock, std::chrono::seconds(1), [this] {
+    this->activation_condvar.wait_for(lock, std::chrono::seconds(5), [this] {
         return this->activation_state != ActivationState::Pending;
     });
+
+    if (this->activation_state != ActivationState::Success) {
+        Warn(
+            "Timed out waiting for device activation (%s)",
+            serial_number.c_str()
+        );
+    }
 
     return this->activation_state == ActivationState::Success;
 }

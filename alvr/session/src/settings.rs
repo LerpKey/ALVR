@@ -505,7 +505,6 @@ pub struct FoveatedEncodingConfig {
     #[schema(gui(slider(min = 1.0, max = 10.0, step = 1.0)))]
     #[schema(flag = "steamvr-restart")]
     pub edge_ratio_y: f32,
-    
 }
 
 #[repr(C)]
@@ -1484,6 +1483,22 @@ pub struct LoggingConfig {
     #[schema(flag = "real-time")]
     pub log_haptics: bool,
 
+    #[schema(strings(help = "Enable data collection for debug and analysis purposes."))]
+    #[schema(flag = "real-time")]
+    pub enable_data_collection: bool,
+
+    #[schema(strings(help = "UDP host:port that receives telemetry samples."))]
+    #[schema(flag = "real-time")]
+    pub data_collection_endpoint: String,
+
+    #[schema(strings(help = "Enable on-disk dataset capture for DRL training."))]
+    #[schema(flag = "real-time")]
+    pub enable_dataset_collection: bool,
+
+    #[schema(strings(help = "Directory used to store dataset files."))]
+    #[schema(flag = "steamvr-restart")]
+    pub dataset_directory: String,
+
     #[cfg_attr(not(debug_assertions), schema(flag = "hidden"))]
     #[schema(strings(help = "These settings enable extra spammy logs for debugging purposes."))]
     pub debug_groups: DebugGroupsConfig,
@@ -2105,21 +2120,15 @@ pub fn session_settings_default() -> SettingsDefault {
         },
         extra: ExtraConfigDefault {
             logging: LoggingConfigDefault {
+                show_notification_tip: true,
+                prefer_backtrace: false,
+                notification_level: LogSeverityDefault {
+                    variant: LogSeverityDefaultVariant::Info,
+                },
                 client_log_report_level: SwitchDefault {
                     enabled: true,
                     content: LogSeverityDefault {
-                        variant: LogSeverityDefaultVariant::Error,
-                    },
-                },
-                log_to_disk: cfg!(debug_assertions),
-                log_button_presses: false,
-                log_tracking: false,
-                log_haptics: false,
-                notification_level: LogSeverityDefault {
-                    variant: if cfg!(debug_assertions) {
-                        LogSeverityDefaultVariant::Info
-                    } else {
-                        LogSeverityDefaultVariant::Warning
+                        variant: LogSeverityDefaultVariant::Warning,
                     },
                 },
                 show_raw_events: SwitchDefault {
@@ -2128,8 +2137,14 @@ pub fn session_settings_default() -> SettingsDefault {
                         hide_spammy_events: false,
                     },
                 },
-                prefer_backtrace: false,
-                show_notification_tip: true,
+                log_to_disk: true,
+                log_tracking: false,
+                log_button_presses: false,
+                log_haptics: false,
+                enable_data_collection: false,
+                data_collection_endpoint: "127.0.0.1:49152".into(),
+                enable_dataset_collection: false,
+                dataset_directory: String::new(),
                 debug_groups: DebugGroupsConfigDefault {
                     server_impl: false,
                     client_impl: false,

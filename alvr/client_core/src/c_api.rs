@@ -20,7 +20,7 @@ use alvr_graphics::{
 };
 use alvr_packets::{ButtonEntry, ButtonValue, FaceData, ViewParams};
 use alvr_session::{
-    CodecType, FoveatedEncodingConfig, MediacodecPropType, MediacodecProperty, UpscalingConfig, 
+    CodecType, FoveatedEncodingConfig, MediacodecPropType, MediacodecProperty, UpscalingConfig,
 };
 use std::{
     cell::RefCell,
@@ -601,6 +601,7 @@ pub extern "C" fn alvr_send_tracking(
                 eye_gazes,
                 ..Default::default()
             },
+            None, // No WiFi metrics from C API - this is a legacy interface
         );
     }
 }

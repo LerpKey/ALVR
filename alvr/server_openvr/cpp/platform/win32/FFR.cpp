@@ -9,15 +9,17 @@ using namespace d3d_render_utils;
 
 namespace {
 
-struct FoveationVars {
+struct alignas(16) FoveationVars {
     // Match HLSL cbuffer layout exactly - using packed vectors
     uint32_t targetResolution[2];      // uint2 targetResolution
     uint32_t optimizedResolution[2];   // uint2 optimizedResolution
     float eyeSizeRatio[2];             // float2 eyeSizeRatio
     float centerSize[2];               // float2 centerSize
-    float centerShift[2];              // float2 centerShift (contains FFR + DFR combined)
+    float baseCenterL[2];              // float2 baseCenterL (static FFR center left, aligned)
+    float baseCenterR[2];              // float2 baseCenterR (static FFR center right, aligned)
+    float eyeShiftL[2];                // float2 eyeShiftL
+    float eyeShiftR[2];                // float2 eyeShiftR
     float edgeRatio[2];                // float2 edgeRatio
-    // NOTE: Using centerShift to combine FFR base + DFR eye shift to maintain compatibility
 };
 
 FoveationVars CalculateFoveationVars() {
@@ -70,16 +72,20 @@ FoveationVars CalculateFoveationVars() {
     vars.eyeSizeRatio[1] = eyeHeightRatioAligned;
     vars.centerSize[0] = centerSizeXAligned;
     vars.centerSize[1] = centerSizeYAligned;
-    // NOTE: centerShift field now carries eyeShift data (dynamic eye tracking)
-    // Static FFR center (0.4, 0.1) is hardcoded in HLSL shader
-    vars.centerShift[0] = 0.0f;  // Will be set to eyeShift data in UpdateFoveationParams
-    vars.centerShift[1] = 0.0f;
+    vars.baseCenterL[0] = centerShiftXAligned;
+    vars.baseCenterL[1] = centerShiftYAligned;
+    vars.baseCenterR[0] = centerShiftXAligned;
+    vars.baseCenterR[1] = centerShiftYAligned;
+    // eyeShift will be filled in UpdateFoveationParams
+    vars.eyeShiftL[0] = 0.0f;
+    vars.eyeShiftL[1] = 0.0f;
+    vars.eyeShiftR[0] = 0.0f;
+    vars.eyeShiftR[1] = 0.0f;
     vars.edgeRatio[0] = edgeRatioX;
     vars.edgeRatio[1] = edgeRatioY;
-    // NOTE: centerShift field now exclusively carries dynamic eye tracking data
 
-    // Ensure buffer size matches original HLSL expectations (48 bytes = 6 * float2)
-    static_assert(sizeof(FoveationVars) == 48, "FoveationVars size must match original HLSL cbuffer layout");
+    // Ensure buffer size matches HLSL expectations (80 bytes = 5 * 16-byte rows)
+    static_assert(sizeof(FoveationVars) == 80, "FoveationVars size must match HLSL cbuffer layout");
 
     return vars;
 }
@@ -158,7 +164,7 @@ void FFR::UpdateFoveationParams(uint64_t target_timestamp_ns) {
     auto fovVars = CalculateFoveationVars();
 
     // 🎯 使用统一时间戳生成器：SteamVR的targetTimestampNs确保Frame-Perfect绑定
-    DFRShiftParams dfrShift = {0.0f, 0.0f, false}; // Default fallback
+    DFRShiftParams dfrShift = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, false}; // Default fallback
     try {
         if (target_timestamp_ns != 0) {
             // 🎯 关键：使用SteamVR的精确时间戳获取shift数据
@@ -170,19 +176,23 @@ void FFR::UpdateFoveationParams(uint64_t target_timestamp_ns) {
         }
 
         if (dfrShift.is_eye_tracked) {
-            // centerShift now carries pure eyeShift data (static FFR center hardcoded in shader)
-            fovVars.centerShift[0] = dfrShift.shift_x;
-            fovVars.centerShift[1] = dfrShift.shift_y;
+            fovVars.eyeShiftL[0] = dfrShift.left_shift_x;
+            fovVars.eyeShiftL[1] = dfrShift.left_shift_y;
+            fovVars.eyeShiftR[0] = dfrShift.right_shift_x;
+            fovVars.eyeShiftR[1] = dfrShift.right_shift_y;
         } else {
-            // No eye tracking: set eyeShift to zero (use static FFR only)
-            fovVars.centerShift[0] = 0.0f;
-            fovVars.centerShift[1] = 0.0f;
+            fovVars.eyeShiftL[0] = fovVars.baseCenterL[0];
+            fovVars.eyeShiftL[1] = fovVars.baseCenterL[1];
+            fovVars.eyeShiftR[0] = fovVars.baseCenterR[0];
+            fovVars.eyeShiftR[1] = fovVars.baseCenterR[1];
         }
     } catch (...) {
         // Rust function failed: set eyeShift to zero (use static FFR only)
         Error("🎯 RUST_ERROR: get_eye_tracked_ffr_shift_with_timestamp failed\n");
-        fovVars.centerShift[0] = 0.0f;
-        fovVars.centerShift[1] = 0.0f;
+        fovVars.eyeShiftL[0] = fovVars.baseCenterL[0];
+        fovVars.eyeShiftL[1] = fovVars.baseCenterL[1];
+        fovVars.eyeShiftR[0] = fovVars.baseCenterR[0];
+        fovVars.eyeShiftR[1] = fovVars.baseCenterR[1];
     }
 
     // Update the constant buffer with corrected Map/Unmap usage
@@ -204,11 +214,48 @@ void FFR::UpdateFoveationParams(uint64_t target_timestamp_ns) {
         if (++successCount % 600 == 0) { // Log every 10 seconds at 60fps
             if (dfrShift.is_eye_tracked) {
                 Info("🎯 DFR Unified: Buffer updated %d times, timestamp=%llu, eyeShift (%.3f, %.3f)\n",
-                     successCount, target_timestamp_ns, fovVars.centerShift[0], fovVars.centerShift[1]);
+                     successCount, target_timestamp_ns, fovVars.eyeShiftL[0], fovVars.eyeShiftL[1]);
             } else {
                 Info("🎯 FFR Unified: Buffer updated %d times, timestamp=%llu, eyeShift (0.0, 0.0)\n",
                      successCount, target_timestamp_ns);
             }
+        }
+
+        // Detailed bounds diagnostics (throttled)
+        static int boundsDebugCount = 0;
+        if (++boundsDebugCount % 120 == 0) { // ~2s at 60fps
+            auto logBounds = [&](const char* eyeLabel, float eyeShiftX, float eyeShiftY) {
+                // Match shader math for bounds
+                float finalShiftX = 0.4f + eyeShiftX;
+                float finalShiftY = 0.1f - eyeShiftY;
+
+                float c0x = (1.f - fovVars.centerSize[0]) * 0.5f;
+                float c0y = (1.f - fovVars.centerSize[1]) * 0.5f;
+                float c1x = (fovVars.edgeRatio[0] - 1.f) * c0x * (finalShiftX + 1.f) / fovVars.edgeRatio[0];
+                float c1y = (fovVars.edgeRatio[1] - 1.f) * c0y * (finalShiftY + 1.f) / fovVars.edgeRatio[1];
+                float c2x = (fovVars.edgeRatio[0] - 1.f) * fovVars.centerSize[0] + 1.f;
+                float c2y = (fovVars.edgeRatio[1] - 1.f) * fovVars.centerSize[1] + 1.f;
+                float loBoundX = c0x * (finalShiftX + 1.f) / c2x;
+                float loBoundY = c0y * (finalShiftY + 1.f) / c2y;
+                float hiBoundX = c0x * (finalShiftX - 1.f) / c2x + 1.f;
+                float hiBoundY = c0y * (finalShiftY - 1.f) / c2y + 1.f;
+
+                Info(
+                    "🎯 FFR BOUNDS [%s] centerSize=(%.3f,%.3f) edgeRatio=(%.3f,%.3f) finalShift=(%.3f,%.3f) lo=(%.3f,%.3f) hi=(%.3f,%.3f) eyeSizeRatio=(%.3f,%.3f)",
+                    eyeLabel,
+                    fovVars.centerSize[0], fovVars.centerSize[1],
+                    fovVars.edgeRatio[0], fovVars.edgeRatio[1],
+                    finalShiftX, finalShiftY,
+                    loBoundX, loBoundY,
+                    hiBoundX, hiBoundY,
+                    fovVars.eyeSizeRatio[0], fovVars.eyeSizeRatio[1]
+                );
+            };
+
+            // Left eye (no X flip, Y invert)
+            logBounds("L", fovVars.eyeShiftL[0], fovVars.eyeShiftL[1]);
+            // Right eye (X and Y invert)
+            logBounds("R", -fovVars.eyeShiftR[0], -fovVars.eyeShiftR[1]);
         }
     } else {
         // Log error details for debugging

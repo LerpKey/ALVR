@@ -230,6 +230,25 @@ pub struct BatteryInfo {
     pub is_plugged: bool,
 }
 
+// WiFi signal metrics for PHY/MAC layer monitoring
+// Collected at tracking frequency (3x refresh rate) for DRL-based ABR research
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct WiFiMetrics {
+    pub timestamp_ns: u64,                    // Nanosecond precision timestamp (xr_runtime_now)
+    pub rssi_dbm: i32,                        // Received Signal Strength Indicator (-100 to 0 dBm)
+    pub frequency_mhz: u32,                   // WiFi frequency band (2400, 5000, 6000 MHz)
+    pub link_speed_mbps: u32,                 // Current link speed in Mbps
+    pub mcs_index: Option<u8>,                // Modulation and Coding Scheme index (0-9)
+    pub snr_db: Option<f32>,                  // Signal-to-Noise Ratio in dB
+    pub tx_bitrate_mbps: Option<f32>,         // Transmit bitrate in Mbps
+    pub rx_bitrate_mbps: Option<f32>,         // Receive bitrate in Mbps
+    pub tx_retries: Option<u32>,              // Number of transmit retries
+    pub tx_failures: Option<u32>,             // Number of transmit failures
+    pub wifi_standard: String,                // "802.11ac", "802.11ax", etc.
+    pub channel_width: u32,                   // Channel width in MHz (20, 40, 80, 160)
+    pub guard_interval: Option<u32>,          // Guard interval in ns (400, 800)
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
 pub enum ButtonValue {
     Binary(bool),
@@ -279,21 +298,21 @@ pub type EyePoseStatusPICO = u32;
 // PICO Eye Pose Status bit flags (from PICO documentation)
 pub mod eye_pose_status_pico {
     // Primary gaze data flags (most important)
-    pub const GAZE_POINT_VALID: u32 = 1 << 0;              // XR_ET_GAZE_POINT_VALID_PICO
-    pub const GAZE_VECTOR_VALID: u32 = 1 << 1;             // XR_ET_GAZE_VECTOR_VALID_PICO
-    pub const EYE_OPENNESS_VALID: u32 = 1 << 2;            // XR_ET_EYE_OPENNESS_VALID_PICO
-    pub const EYE_PUPIL_DILATION_VALID: u32 = 1 << 3;      // XR_ET_EYE_PUPIL_DILATION_VALID_PICO
-    pub const EYE_POSITION_GUIDE_VALID: u32 = 1 << 4;      // XR_ET_EYE_POSITION_GUIDE_VALID_PICO
-    pub const EYE_PUPIL_POSITION_VALID: u32 = 1 << 5;      // XR_ET_EYE_PUPIL_POSITION_VALID_PICO
+    pub const GAZE_POINT_VALID: u32 = 1 << 0; // XR_ET_GAZE_POINT_VALID_PICO
+    pub const GAZE_VECTOR_VALID: u32 = 1 << 1; // XR_ET_GAZE_VECTOR_VALID_PICO
+    pub const EYE_OPENNESS_VALID: u32 = 1 << 2; // XR_ET_EYE_OPENNESS_VALID_PICO
+    pub const EYE_PUPIL_DILATION_VALID: u32 = 1 << 3; // XR_ET_EYE_PUPIL_DILATION_VALID_PICO
+    pub const EYE_POSITION_GUIDE_VALID: u32 = 1 << 4; // XR_ET_EYE_POSITION_GUIDE_VALID_PICO
+    pub const EYE_PUPIL_POSITION_VALID: u32 = 1 << 5; // XR_ET_EYE_PUPIL_POSITION_VALID_PICO
     pub const EYE_CONVERGENCE_DISTANCE_VALID: u32 = 1 << 6; // XR_ET_EYE_CONVERGENCE_DISTANCE_VALID_PICO
-    
+
     // Extended flags (possibly duplicates or different meanings)
-    pub const EYE_GAZE_POINT_VALID_EXT: u32 = 1 << 7;      // XR_ET_EYE_GAZE_POINT_VALID_PICO (duplicate?)
-    pub const EYE_GAZE_VECTOR_VALID_EXT: u32 = 1 << 8;     // XR_ET_EYE_GAZE_VECTOR_VALID_PICO (duplicate?)
-    pub const PUPIL_DISTANCE_VALID: u32 = 1 << 9;          // XR_ET_PUPIL_DISTANCE_VALID_PICO
+    pub const EYE_GAZE_POINT_VALID_EXT: u32 = 1 << 7; // XR_ET_EYE_GAZE_POINT_VALID_PICO (duplicate?)
+    pub const EYE_GAZE_VECTOR_VALID_EXT: u32 = 1 << 8; // XR_ET_EYE_GAZE_VECTOR_VALID_PICO (duplicate?)
+    pub const PUPIL_DISTANCE_VALID: u32 = 1 << 9; // XR_ET_PUPIL_DISTANCE_VALID_PICO
     pub const CONVERGENCE_DISTANCE_VALID_EXT: u32 = 1 << 10; // XR_ET_CONVERGENCE_DISTANCE_VALID_PICO (duplicate?)
-    pub const PUPIL_DIAMETER_VALID: u32 = 1 << 11;         // XR_ET_PUPIL_DIAMETER_VALID_PICO
-    
+    pub const PUPIL_DIAMETER_VALID: u32 = 1 << 11; // XR_ET_PUPIL_DIAMETER_VALID_PICO
+
     pub fn has_flag(status: u32, flag: u32) -> bool {
         (status & flag) != 0
     }
@@ -313,13 +332,16 @@ pub mod eye_pose_status_pico {
     }
 
     pub fn is_pupil_dilation_valid(status: u32) -> bool {
-        has_flag(status, EYE_PUPIL_DILATION_VALID)
+        // Check both primary (bit 3) and extended (bit 11) pupil flags
+        // PICO firmware may use either EYE_PUPIL_DILATION_VALID or PUPIL_DIAMETER_VALID
+        // depending on headset model/version (similar to gaze_vector dual-flag pattern)
+        has_flag(status, EYE_PUPIL_DILATION_VALID) || has_flag(status, PUPIL_DIAMETER_VALID)
     }
 
     // Diagnostic function to show all flag states
     pub fn get_flag_debug_info(status: u32) -> String {
         format!(
-            "Status: {} | GP0:{} GP7:{} | GV1:{} GV8:{} | EO2:{} | PD3:{} | Raw: {:012b}",
+            "Status: {} | GP0:{} GP7:{} | GV1:{} GV8:{} | EO2:{} | PD3:{} PD11:{} | Raw: {:012b}",
             status,
             has_flag(status, GAZE_POINT_VALID),
             has_flag(status, EYE_GAZE_POINT_VALID_EXT),
@@ -327,6 +349,7 @@ pub mod eye_pose_status_pico {
             has_flag(status, EYE_GAZE_VECTOR_VALID_EXT),
             has_flag(status, EYE_OPENNESS_VALID),
             has_flag(status, EYE_PUPIL_DILATION_VALID),
+            has_flag(status, PUPIL_DIAMETER_VALID),
             status
         )
     }
@@ -355,6 +378,16 @@ pub struct EyeTrackingDataPICO {
     pub foveated_gaze_tracking_state: i32,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum EyeTrackingInputStatus {
+    #[default]
+    Unsupported,
+    /// Eye tracking hardware is present but currently not feeding gaze samples (eyes closed or HMD removed)
+    Standby,
+    /// Valid gaze data is being produced this frame
+    Active,
+}
+
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct FaceData {
     pub eye_gazes: [Option<Pose>; 2],
@@ -362,12 +395,18 @@ pub struct FaceData {
     pub htc_eye_expression: Option<Vec<f32>>,
     pub htc_lip_expression: Option<Vec<f32>>, // issue: Serialize does not support [f32; 37]
     pub pico_eye_tracking_data: Option<EyeTrackingDataPICO>, // PICO eye tracking data
+    #[serde(default)]
+    pub eye_tracking_state: EyeTrackingInputStatus,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
 pub struct DFRShiftData {
     pub shift_x: f32,
     pub shift_y: f32,
+    pub left_shift_x: f32,
+    pub left_shift_y: f32,
+    pub right_shift_x: f32,
+    pub right_shift_y: f32,
     pub sequence_id: u64,
     pub is_eye_tracked: bool,
 }
@@ -386,6 +425,10 @@ pub struct Tracking {
     pub device_motions: Vec<(u64, DeviceMotion)>,
     pub hand_skeletons: [Option<[Pose; 26]>; 2],
     pub face_data: FaceData,
+    pub wifi_metrics: Option<WiFiMetrics>, // High-frequency WiFi signal monitoring
+    // Raw HEAD motion before linear extrapolation prediction.
+    // Used for telemetry to compare actual vs predicted poses.
+    pub raw_head_motion: Option<DeviceMotion>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -510,11 +553,19 @@ pub struct RealTimeConfig {
     pub dynamic_foveated_center: Option<DynamicFoveatedCenter>,
 }
 
-// Simple dynamic foveated center for eye tracking
+// Dynamic foveated center for eye tracking with per-eye support
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DynamicFoveatedCenter {
-    pub center_shift_x: f32,    // Horizontal center shift [-1, 1]
-    pub center_shift_y: f32,    // Vertical center shift [-1, 1]
+    pub center_shift_x: f32, // Combined horizontal center shift [-1, 1] (legacy/fallback)
+    pub center_shift_y: f32, // Combined vertical center shift [-1, 1] (legacy/fallback)
+    #[serde(default)]
+    pub left_shift_x: f32, // Left eye horizontal shift [-1, 1]
+    #[serde(default)]
+    pub left_shift_y: f32, // Left eye vertical shift [-1, 1]
+    #[serde(default)]
+    pub right_shift_x: f32, // Right eye horizontal shift [-1, 1]
+    #[serde(default)]
+    pub right_shift_y: f32, // Right eye vertical shift [-1, 1]
     #[serde(default)]
     pub sequence_id: Option<u64>, // Synchronization sequence ID for pipeline consistency
 }

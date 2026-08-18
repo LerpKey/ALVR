@@ -1,18 +1,18 @@
 mod body;
+pub mod eye_tracked_ffr;
 mod face;
 mod vmc;
-pub mod eye_tracked_ffr;
 
 pub use body::*;
+pub use eye_tracked_ffr::*;
 pub use face::*;
 pub use vmc::*;
-pub use eye_tracked_ffr::*;
 
 use crate::{
     connection::STREAMING_RECV_TIMEOUT,
     hand_gestures::{self, HandGestureManager, HAND_GESTURE_BUTTON_SET},
     input_mapping::ButtonMappingManager,
-    ConnectionContext, ServerCoreEvent, SESSION_MANAGER, FILESYSTEM_LAYOUT,
+    ConnectionContext, ServerCoreEvent, FILESYSTEM_LAYOUT, SESSION_MANAGER,
 };
 use alvr_common::{
     glam::{EulerRot, Quat, Vec3},
@@ -23,13 +23,13 @@ use alvr_common::{
 };
 use alvr_events::{EventType, TrackingEvent};
 use alvr_packets::{EyeTrackingDataPICO, FaceData, Tracking};
-use serde::{Deserialize, Serialize};
 use alvr_session::{
     settings_schema::Switch, BodyTrackingConfig, HeadsetConfig, PositionRecenteringMode,
     RotationRecenteringMode, Settings, VMCConfig,
 };
 use alvr_sockets::StreamReceiver;
 use chrono;
+use serde::{Deserialize, Serialize};
 use serde_json;
 use std::{
     cmp::Ordering,
@@ -38,7 +38,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const DEG_TO_RAD: f32 = PI / 180.0;
@@ -88,12 +88,14 @@ fn is_valid_eye_data(pose: &Pose) -> bool {
     // Check if all values are non-zero or not too close to default values
     let pos = pose.position;
     let ori = pose.orientation;
-    
+
     // If position is essentially zero and orientation is identity, likely invalid
     let pos_near_zero = pos.length_squared() < 1e-6;
-    let ori_near_identity = (ori.w.abs() - 1.0).abs() < 1e-6 && 
-                           ori.x.abs() < 1e-6 && ori.y.abs() < 1e-6 && ori.z.abs() < 1e-6;
-    
+    let ori_near_identity = (ori.w.abs() - 1.0).abs() < 1e-6
+        && ori.x.abs() < 1e-6
+        && ori.y.abs() < 1e-6
+        && ori.z.abs() < 1e-6;
+
     // Valid data should have some meaningful values
     !pos_near_zero || !ori_near_identity
 }
@@ -104,14 +106,13 @@ fn get_time_components() -> (String, u64, u64) {
     let timestamp_ms = now.as_millis() as u64;
     let unix_timestamp = now.as_secs();
     let current_minute = unix_timestamp / 60;
-    
+
     // Create local time string in yy-mm-dd-hh-mm format
     let local_time = chrono::DateTime::<chrono::Local>::from(SystemTime::now());
     let time_str = local_time.format("%y-%m-%d-%H-%M").to_string();
-    
+
     (time_str, current_minute, timestamp_ms)
 }
-
 
 fn log_gaze_data_to_file(face_data: &FaceData, timestamp: Duration) {
     if let Some(filesystem_layout) = FILESYSTEM_LAYOUT.get() {
@@ -122,16 +123,16 @@ fn log_gaze_data_to_file(face_data: &FaceData, timestamp: Duration) {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        
-        // For file naming, still use current time to avoid too frequent file creation  
+
+        // For file naming, still use current time to avoid too frequent file creation
         let (time_str, current_minute, _) = get_time_components();
-        
+
         // Create gazelog directory in build folder
         let gazelog_dir = filesystem_layout.log_dir.join("gazelog");
         if let Err(_) = fs::create_dir_all(&gazelog_dir) {
             return;
         }
-        
+
         // Check if we need to rotate files (new minute)
         let _should_rotate = {
             let mut last_minute = LAST_FILE_MINUTE.lock().unwrap();
@@ -147,23 +148,27 @@ fn log_gaze_data_to_file(face_data: &FaceData, timestamp: Duration) {
                 _ => false,
             }
         };
-        
+
         // Only log if we have genuinely valid eye gaze data
-        let left_valid = face_data.eye_gazes[0].as_ref().map_or(false, is_valid_eye_data);
-        let right_valid = face_data.eye_gazes[1].as_ref().map_or(false, is_valid_eye_data);
-        
+        let left_valid = face_data.eye_gazes[0]
+            .as_ref()
+            .map_or(false, is_valid_eye_data);
+        let right_valid = face_data.eye_gazes[1]
+            .as_ref()
+            .map_or(false, is_valid_eye_data);
+
         if !left_valid && !right_valid {
             return; // No valid eye tracking data
         }
-        
+
         let json_path = gazelog_dir.join(format!("{}.json", time_str));
         let csv_path = gazelog_dir.join(format!("{}.csv", time_str));
-        
+
         // Create CSV header if file doesn't exist
         let csv_exists = csv_path.exists();
-        
+
         // Prepare the data structure
-        
+
         // Log JSON format
         if let Ok(mut json_file) = OpenOptions::new()
             .create(true)
@@ -171,7 +176,7 @@ fn log_gaze_data_to_file(face_data: &FaceData, timestamp: Duration) {
             .open(&json_path)
         {
             let mut device_motion_data = serde_json::Map::new();
-            
+
             if left_valid {
                 if let Some(left_eye) = &face_data.eye_gazes[0] {
                     device_motion_data.insert("left_eye".to_string(), serde_json::json!({
@@ -182,7 +187,7 @@ fn log_gaze_data_to_file(face_data: &FaceData, timestamp: Duration) {
             } else {
                 device_motion_data.insert("left_eye".to_string(), serde_json::Value::Null);
             }
-            
+
             if right_valid {
                 if let Some(right_eye) = &face_data.eye_gazes[1] {
                     device_motion_data.insert("right_eye".to_string(), serde_json::json!({
@@ -193,36 +198,32 @@ fn log_gaze_data_to_file(face_data: &FaceData, timestamp: Duration) {
             } else {
                 device_motion_data.insert("right_eye".to_string(), serde_json::Value::Null);
             }
-            
+
             let log_entry = serde_json::json!({
                 "timestamp_ms": timestamp_ms,
                 "unix_timestamp": unix_timestamp,
                 "device_motion_key": "eye_tracking",
                 "data": device_motion_data
             });
-            
+
             let _ = writeln!(json_file, "{}", log_entry);
             let _ = json_file.flush();
         }
-        
+
         // Log CSV format
-        if let Ok(mut csv_file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&csv_path)
-        {
+        if let Ok(mut csv_file) = OpenOptions::new().create(true).append(true).open(&csv_path) {
             // Write header if new file
             if !csv_exists {
                 let _ = writeln!(csv_file, "timestamp_ms,unix_timestamp,device_motion_key,left_eye_pos_x,left_eye_pos_y,left_eye_pos_z,left_eye_ori_x,left_eye_ori_y,left_eye_ori_z,left_eye_ori_w,right_eye_pos_x,right_eye_pos_y,right_eye_pos_z,right_eye_ori_x,right_eye_ori_y,right_eye_ori_z,right_eye_ori_w");
             }
-            
+
             // Prepare CSV row data
             let mut row = vec![
                 timestamp_ms.to_string(),
                 unix_timestamp.to_string(),
                 "eye_tracking".to_string(),
             ];
-            
+
             // Left eye data
             if left_valid {
                 if let Some(left_eye) = &face_data.eye_gazes[0] {
@@ -241,7 +242,7 @@ fn log_gaze_data_to_file(face_data: &FaceData, timestamp: Duration) {
             } else {
                 row.extend(vec!["null".to_string(); 7]);
             }
-            
+
             // Right eye data
             if right_valid {
                 if let Some(right_eye) = &face_data.eye_gazes[1] {
@@ -260,8 +261,88 @@ fn log_gaze_data_to_file(face_data: &FaceData, timestamp: Duration) {
             } else {
                 row.extend(vec!["null".to_string(); 7]);
             }
-            
+
             let _ = writeln!(csv_file, "{}", row.join(","));
+            let _ = csv_file.flush();
+        }
+    }
+}
+
+/// Log WiFi metrics to file for DRL-based ABR research
+fn log_wifi_metrics_to_file(wifi_metrics: &alvr_packets::WiFiMetrics, timestamp: Duration) {
+    if let Some(filesystem_layout) = FILESYSTEM_LAYOUT.get() {
+        // Use the actual timestamp from tracking loop (system uptime)
+        let timestamp_ms = timestamp.as_millis() as u64;
+        // Convert system uptime to unix UTC timestamp
+        let unix_timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        // For file naming, use current time to avoid too frequent file creation
+        let (time_str, _current_minute, _) = get_time_components();
+
+        // Create wifilog directory in build folder
+        let wifilog_dir = filesystem_layout.log_dir.join("wifilog");
+        if let Err(_) = fs::create_dir_all(&wifilog_dir) {
+            return;
+        }
+
+        let json_path = wifilog_dir.join(format!("{}.json", time_str));
+        let csv_path = wifilog_dir.join(format!("{}.csv", time_str));
+
+        // Create CSV header if file doesn't exist
+        let csv_exists = csv_path.exists();
+
+        // Log JSON format
+        if let Ok(mut json_file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&json_path)
+        {
+            let log_entry = serde_json::json!({
+                "timestamp_ms": timestamp_ms,
+                "unix_timestamp": unix_timestamp,
+                "device_motion_key": "wifi_metrics",
+                "data": {
+                    "timestamp_ns": wifi_metrics.timestamp_ns,
+                    "rssi_dbm": wifi_metrics.rssi_dbm,
+                    "frequency_mhz": wifi_metrics.frequency_mhz,
+                    "link_speed_mbps": wifi_metrics.link_speed_mbps,
+                    "wifi_standard": wifi_metrics.wifi_standard,
+                    "channel_width_mhz": wifi_metrics.channel_width,
+                    "authenticity": "REAL_DATA_ONLY", // Research authenticity marker
+                    "source": "Android WiFiInfo API",
+                    "available_metrics": ["rssi_dbm", "frequency_mhz", "link_speed_mbps"],
+                    "unavailable_metrics": ["mcs_index", "snr_db", "tx_bitrate_mbps", "rx_bitrate_mbps", "tx_retries", "tx_failures", "guard_interval"]
+                }
+            });
+
+            let _ = writeln!(json_file, "{}", log_entry);
+            let _ = json_file.flush();
+        }
+
+        // Log CSV format
+        if let Ok(mut csv_file) = OpenOptions::new().create(true).append(true).open(&csv_path) {
+            // Write header if new file
+            if !csv_exists {
+                let _ = writeln!(csv_file, "timestamp_ms,unix_timestamp,device_motion_key,timestamp_ns,rssi_dbm,frequency_mhz,link_speed_mbps,wifi_standard,channel_width_mhz,note");
+            }
+
+            let row = format!(
+                "{},{},wifi_metrics,{},{},{},{},{},{},{}",
+                timestamp_ms,
+                unix_timestamp,
+                wifi_metrics.timestamp_ns,
+                wifi_metrics.rssi_dbm,
+                wifi_metrics.frequency_mhz,
+                wifi_metrics.link_speed_mbps,
+                wifi_metrics.wifi_standard,
+                wifi_metrics.channel_width,
+                "REAL_DATA_ONLY" // Research note about data authenticity
+            );
+
+            let _ = writeln!(csv_file, "{}", row);
             let _ = csv_file.flush();
         }
     }
@@ -277,16 +358,16 @@ fn log_eye_tracking_data_to_file(eye_data: &EyeTrackingDataLog, timestamp: Durat
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        
+
         // For file naming, still use current time to avoid too frequent file creation
         let (time_str, current_minute, _) = get_time_components();
-        
-        // Create eyelog directory in build folder  
+
+        // Create eyelog directory in build folder
         let eyelog_dir = filesystem_layout.log_dir.join("eyelog");
         if let Err(_) = fs::create_dir_all(&eyelog_dir) {
             return;
         }
-        
+
         // Check if we need to rotate files (new minute)
         let _should_rotate = {
             let mut last_minute = LAST_FILE_MINUTE.lock().unwrap();
@@ -302,13 +383,13 @@ fn log_eye_tracking_data_to_file(eye_data: &EyeTrackingDataLog, timestamp: Durat
                 _ => false,
             }
         };
-        
+
         let json_path = eyelog_dir.join(format!("{}.json", time_str));
         let csv_path = eyelog_dir.join(format!("{}.csv", time_str));
-        
+
         // Create CSV header if file doesn't exist
         let csv_exists = csv_path.exists();
-        
+
         // Log JSON format - complete eye tracking data
         if let Ok(mut json_file) = OpenOptions::new()
             .create(true)
@@ -358,22 +439,18 @@ fn log_eye_tracking_data_to_file(eye_data: &EyeTrackingDataLog, timestamp: Durat
                     "foveated_gaze_tracking_state": eye_data.foveated_gaze_tracking_state
                 }
             });
-            
+
             let _ = writeln!(json_file, "{}", log_entry);
             let _ = json_file.flush();
         }
-        
+
         // Log CSV format - comprehensive eye tracking data
-        if let Ok(mut csv_file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&csv_path)
-        {
+        if let Ok(mut csv_file) = OpenOptions::new().create(true).append(true).open(&csv_path) {
             // Write header if new file
             if !csv_exists {
                 let _ = writeln!(csv_file, "timestamp_ms,unix_timestamp,device_motion_key,timestamp_ns,left_status_flags,left_gaze_point_valid,left_gaze_vector_valid,left_eye_openness_valid,left_pupil_dilation_valid,right_status_flags,right_gaze_point_valid,right_gaze_vector_valid,right_eye_openness_valid,right_pupil_dilation_valid,combined_status_flags,combined_gaze_point_valid,combined_gaze_vector_valid,combined_eye_openness_valid,combined_pupil_dilation_valid,left_gaze_point_x,left_gaze_point_y,left_gaze_point_z,right_gaze_point_x,right_gaze_point_y,right_gaze_point_z,combined_gaze_point_x,combined_gaze_point_y,combined_gaze_point_z,left_gaze_vector_x,left_gaze_vector_y,left_gaze_vector_z,right_gaze_vector_x,right_gaze_vector_y,right_gaze_vector_z,combined_gaze_vector_x,combined_gaze_vector_y,combined_gaze_vector_z,left_eye_openness,right_eye_openness,left_pupil_dilation,right_pupil_dilation,left_position_guide_x,left_position_guide_y,left_position_guide_z,right_position_guide_x,right_position_guide_y,right_position_guide_z,foveated_gaze_direction_x,foveated_gaze_direction_y,foveated_gaze_direction_z,foveated_gaze_tracking_state");
             }
-            
+
             let row = format!(
                 "{},{},pico_eye_tracking_raw,{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 timestamp_ms,
@@ -427,7 +504,7 @@ fn log_eye_tracking_data_to_file(eye_data: &EyeTrackingDataLog, timestamp: Durat
                 eye_data.foveated_gaze_direction[2],
                 eye_data.foveated_gaze_tracking_state
             );
-            
+
             let _ = writeln!(csv_file, "{}", row);
             let _ = csv_file.flush();
         }
@@ -456,12 +533,22 @@ pub struct TrackingManager {
     hand_skeletons_history: [VecDeque<(Duration, [Pose; 26])>; 2],
     last_face_data: FaceData,
     last_pico_eye_data: Option<EyeTrackingDataLog>, // PICO eye tracking state cache
-    last_pico_timestamp: Option<u64>, // Track last PICO timestamp to avoid duplicates
+    last_pico_timestamp: Option<u64>,               // Track last PICO timestamp to avoid duplicates
     max_history_size: usize,
+    // State log age tracking
+    last_head_update_instant: Instant,
+    last_face_data_update_instant: Instant,
+    // Cached rendered pose for ATW delta calculation (updated on ClientStatistics arrival)
+    last_rendered_pose: Option<DeviceMotion>,
+    // Raw HEAD motion history (before linear extrapolation prediction)
+    // Used for telemetry to compare actual vs predicted poses
+    raw_head_motion_history: VecDeque<(Duration, DeviceMotion)>,
+    last_raw_head_update_instant: Instant,
 }
 
 impl TrackingManager {
     pub fn new(max_history_size: usize) -> TrackingManager {
+        let now = Instant::now();
         TrackingManager {
             last_head_pose: Pose::default(),
             inverse_recentering_origin: Pose::default(),
@@ -471,6 +558,11 @@ impl TrackingManager {
             last_pico_eye_data: None,
             last_pico_timestamp: None,
             max_history_size,
+            last_head_update_instant: now,
+            last_face_data_update_instant: now,
+            last_rendered_pose: None,
+            raw_head_motion_history: VecDeque::new(),
+            last_raw_head_update_instant: now,
         }
     }
 
@@ -584,6 +676,7 @@ impl TrackingManager {
         for &(device_id, mut motion) in device_motions {
             if device_id == *HEAD_ID {
                 self.last_head_pose = motion.pose;
+                self.last_head_update_instant = Instant::now();
             }
 
             if let Some(config) = device_motion_configs.get(&device_id) {
@@ -697,36 +790,129 @@ impl TrackingManager {
     pub fn report_face_data(&mut self, face_data: FaceData) {
         // PICO eye tracking data is already in head local space, no coordinate transformation needed
         self.last_face_data = face_data;
+        self.last_face_data_update_instant = Instant::now();
     }
 
     pub fn get_face_data(&self) -> &FaceData {
         &self.last_face_data
     }
 
+    // ========================================================================
+    // State Log support: methods for 90Hz tick sampling
+    // ========================================================================
+
+    /// Get the latest head motion (most recent from history) with age in milliseconds
+    pub fn get_latest_head_motion_with_age(&self, now: Instant) -> (Option<DeviceMotion>, f32) {
+        let age_ms = now
+            .saturating_duration_since(self.last_head_update_instant)
+            .as_secs_f32()
+            * 1000.0;
+
+        // Get the most recent head motion from history
+        let motion = self
+            .device_motions_history
+            .get(&*HEAD_ID)
+            .and_then(|motions| motions.front())
+            .map(|(_, m)| *m);
+
+        (motion, age_ms)
+    }
+
+    /// Store raw HEAD motion (before linear extrapolation prediction)
+    /// Called when tracking packet arrives with raw_head_motion field
+    pub fn report_raw_head_motion(&mut self, timestamp: Duration, motion: DeviceMotion) {
+        self.raw_head_motion_history.push_front((timestamp, motion));
+        self.last_raw_head_update_instant = Instant::now();
+
+        while self.raw_head_motion_history.len() > self.max_history_size {
+            self.raw_head_motion_history.pop_back();
+        }
+    }
+
+    /// Get the latest raw head motion (before prediction) with age in milliseconds
+    pub fn get_latest_raw_head_motion_with_age(&self, now: Instant) -> (Option<DeviceMotion>, f32) {
+        let age_ms = now
+            .saturating_duration_since(self.last_raw_head_update_instant)
+            .as_secs_f32()
+            * 1000.0;
+
+        let motion = self.raw_head_motion_history.front().map(|(_, m)| *m);
+        (motion, age_ms)
+    }
+
+    /// Get the latest face data with age in milliseconds
+    pub fn get_face_data_with_age(&self, now: Instant) -> (&FaceData, f32) {
+        let age_ms = now
+            .saturating_duration_since(self.last_face_data_update_instant)
+            .as_secs_f32()
+            * 1000.0;
+        (&self.last_face_data, age_ms)
+    }
+
+    // ========================================================================
+    // ATW delta support: cache rendered pose for prediction error calculation
+    // ========================================================================
+
+    /// Cache the rendered pose from the most recent frame submission.
+    /// Called when ClientStatistics arrives with the frame's target_timestamp.
+    pub fn cache_rendered_pose(&mut self, motion: DeviceMotion) {
+        self.last_rendered_pose = Some(motion);
+    }
+
+    /// Get the cached rendered pose for ATW delta calculation.
+    /// Returns None if no frame has been submitted yet.
+    pub fn get_cached_rendered_pose(&self) -> Option<&DeviceMotion> {
+        self.last_rendered_pose.as_ref()
+    }
+
     // Convert EyeTrackingDataPICO to EyeTrackingDataLog format (following face_data pattern)
     fn convert_pico_eye_data(&self, eye_tracking_data: &EyeTrackingDataPICO) -> EyeTrackingDataLog {
         let left_pose_status = EyePoseStatusLog {
             status_flags: eye_tracking_data.left_eye_pose_status,
-            gaze_point_valid: alvr_packets::eye_pose_status_pico::is_gaze_point_valid(eye_tracking_data.left_eye_pose_status),
-            gaze_vector_valid: alvr_packets::eye_pose_status_pico::is_gaze_vector_valid(eye_tracking_data.left_eye_pose_status),
-            eye_openness_valid: alvr_packets::eye_pose_status_pico::is_eye_openness_valid(eye_tracking_data.left_eye_pose_status),
-            pupil_dilation_valid: alvr_packets::eye_pose_status_pico::is_pupil_dilation_valid(eye_tracking_data.left_eye_pose_status),
+            gaze_point_valid: alvr_packets::eye_pose_status_pico::is_gaze_point_valid(
+                eye_tracking_data.left_eye_pose_status,
+            ),
+            gaze_vector_valid: alvr_packets::eye_pose_status_pico::is_gaze_vector_valid(
+                eye_tracking_data.left_eye_pose_status,
+            ),
+            eye_openness_valid: alvr_packets::eye_pose_status_pico::is_eye_openness_valid(
+                eye_tracking_data.left_eye_pose_status,
+            ),
+            pupil_dilation_valid: alvr_packets::eye_pose_status_pico::is_pupil_dilation_valid(
+                eye_tracking_data.left_eye_pose_status,
+            ),
         };
         let right_pose_status = EyePoseStatusLog {
             status_flags: eye_tracking_data.right_eye_pose_status,
-            gaze_point_valid: alvr_packets::eye_pose_status_pico::is_gaze_point_valid(eye_tracking_data.right_eye_pose_status),
-            gaze_vector_valid: alvr_packets::eye_pose_status_pico::is_gaze_vector_valid(eye_tracking_data.right_eye_pose_status),
-            eye_openness_valid: alvr_packets::eye_pose_status_pico::is_eye_openness_valid(eye_tracking_data.right_eye_pose_status),
-            pupil_dilation_valid: alvr_packets::eye_pose_status_pico::is_pupil_dilation_valid(eye_tracking_data.right_eye_pose_status),
+            gaze_point_valid: alvr_packets::eye_pose_status_pico::is_gaze_point_valid(
+                eye_tracking_data.right_eye_pose_status,
+            ),
+            gaze_vector_valid: alvr_packets::eye_pose_status_pico::is_gaze_vector_valid(
+                eye_tracking_data.right_eye_pose_status,
+            ),
+            eye_openness_valid: alvr_packets::eye_pose_status_pico::is_eye_openness_valid(
+                eye_tracking_data.right_eye_pose_status,
+            ),
+            pupil_dilation_valid: alvr_packets::eye_pose_status_pico::is_pupil_dilation_valid(
+                eye_tracking_data.right_eye_pose_status,
+            ),
         };
         let combined_pose_status = EyePoseStatusLog {
             status_flags: eye_tracking_data.combined_eye_pose_status,
-            gaze_point_valid: alvr_packets::eye_pose_status_pico::is_gaze_point_valid(eye_tracking_data.combined_eye_pose_status),
-            gaze_vector_valid: alvr_packets::eye_pose_status_pico::is_gaze_vector_valid(eye_tracking_data.combined_eye_pose_status),
-            eye_openness_valid: alvr_packets::eye_pose_status_pico::is_eye_openness_valid(eye_tracking_data.combined_eye_pose_status),
-            pupil_dilation_valid: alvr_packets::eye_pose_status_pico::is_pupil_dilation_valid(eye_tracking_data.combined_eye_pose_status),
+            gaze_point_valid: alvr_packets::eye_pose_status_pico::is_gaze_point_valid(
+                eye_tracking_data.combined_eye_pose_status,
+            ),
+            gaze_vector_valid: alvr_packets::eye_pose_status_pico::is_gaze_vector_valid(
+                eye_tracking_data.combined_eye_pose_status,
+            ),
+            eye_openness_valid: alvr_packets::eye_pose_status_pico::is_eye_openness_valid(
+                eye_tracking_data.combined_eye_pose_status,
+            ),
+            pupil_dilation_valid: alvr_packets::eye_pose_status_pico::is_pupil_dilation_valid(
+                eye_tracking_data.combined_eye_pose_status,
+            ),
         };
-        
+
         EyeTrackingDataLog {
             timestamp_ns: eye_tracking_data.time,
             left_eye_pose_status: left_pose_status,
@@ -758,18 +944,33 @@ impl TrackingManager {
                 return;
             }
         }
-        
+
         // Add diagnostic info for debugging data issues
         if eye_tracking_data.time == 0 {
             println!("Warning: PICO eye tracking timestamp is 0");
         }
-        
+
         // Debug status flags
         println!("PICO Eye Tracking Debug:");
-        println!("  Left: {}", alvr_packets::eye_pose_status_pico::get_flag_debug_info(eye_tracking_data.left_eye_pose_status));
-        println!("  Right: {}", alvr_packets::eye_pose_status_pico::get_flag_debug_info(eye_tracking_data.right_eye_pose_status));
-        println!("  Combined: {}", alvr_packets::eye_pose_status_pico::get_flag_debug_info(eye_tracking_data.combined_eye_pose_status));
-        
+        println!(
+            "  Left: {}",
+            alvr_packets::eye_pose_status_pico::get_flag_debug_info(
+                eye_tracking_data.left_eye_pose_status
+            )
+        );
+        println!(
+            "  Right: {}",
+            alvr_packets::eye_pose_status_pico::get_flag_debug_info(
+                eye_tracking_data.right_eye_pose_status
+            )
+        );
+        println!(
+            "  Combined: {}",
+            alvr_packets::eye_pose_status_pico::get_flag_debug_info(
+                eye_tracking_data.combined_eye_pose_status
+            )
+        );
+
         // Convert and store the data (only if it's new)
         let converted_data = self.convert_pico_eye_data(&eye_tracking_data);
         self.last_pico_eye_data = Some(converted_data);
@@ -882,6 +1083,11 @@ pub fn tracking_loop(
                 &tracking.device_motions,
             );
 
+            // Store raw HEAD motion (before prediction) for telemetry comparison
+            if let Some(raw_motion) = tracking.raw_head_motion {
+                tracking_manager_lock.report_raw_head_motion(timestamp, raw_motion);
+            }
+
             if let Some(skeleton) = tracking.hand_skeletons[0] {
                 tracking_manager_lock.report_hand_skeleton(HandType::Left, timestamp, skeleton);
             }
@@ -891,11 +1097,11 @@ pub fn tracking_loop(
 
             // DFR: Update eye-tracked foveated rendering parameters before moving data
             DFR_RENDERER.update_from_face_data(&tracking.face_data);
-            
+
             //.report_face_data()的作用是将tracking获取的FaceData整体映射后赋给last_face_data<FaceData>，我认为映射方式有误。
             tracking_manager_lock.report_face_data(tracking.face_data);
-            
-            // Process PICO eye tracking data (following face_data pattern)  
+
+            // Process PICO eye tracking data (following face_data pattern)
             let eye_data_to_report = {
                 let face_data = tracking_manager_lock.get_face_data();
                 face_data.pico_eye_tracking_data.clone()
@@ -903,17 +1109,22 @@ pub fn tracking_loop(
             if let Some(eye_data) = eye_data_to_report {
                 tracking_manager_lock.report_pico_eye_data(eye_data);
             }
-            
+
+            // Process WiFi metrics for DRL-based ABR research
+            if let Some(wifi_metrics) = &tracking.wifi_metrics {
+                // Log WiFi metrics to dedicated file for research analysis
+                log_wifi_metrics_to_file(wifi_metrics, timestamp);
+            }
+
             // Log primary gaze data (from eye_tracker, preferred method)
             let face_data = tracking_manager_lock.get_face_data();
             log_gaze_data_to_file(face_data, timestamp);
-            
-            
+
             // Log PICO eye tracking data using unified interface
             if let Some(eye_data) = tracking_manager_lock.get_pico_eye_data() {
                 log_eye_tracking_data_to_file(eye_data, timestamp);
             }
-            
+
             if let Some(sink) = &mut face_tracking_sink {
                 sink.send_tracking(tracking_manager_lock.get_face_data().clone());
             }

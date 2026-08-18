@@ -8,16 +8,19 @@ use alvr_client_core::{
 };
 use alvr_common::{
     anyhow::Result,
-    log,
     error,
     glam::{Quat, UVec2, Vec2},
+    log,
     parking_lot::RwLock,
     Pose, RelaxedAtomic, HAND_LEFT_ID, HAND_RIGHT_ID, HEAD_ID,
 };
 use alvr_graphics::{
     compute_target_view_resolution, GraphicsContext, StreamRenderer, StreamViewParams,
 };
-use alvr_packets::{DFRShiftData, FaceData, RealTimeConfig, StreamConfig, ViewParams};
+use alvr_packets::{
+    eye_pose_status_pico, EyeTrackingInputStatus, FaceData, RealTimeConfig, StreamConfig,
+    ViewParams,
+};
 use alvr_session::{
     ClientsideFoveationConfig, ClientsideFoveationMode, ClientsidePostProcessingConfig, CodecType,
     FoveatedEncodingConfig, MediacodecProperty, PassthroughMode, UpscalingConfig,
@@ -90,6 +93,35 @@ impl ParsedStreamConfig {
     }
 }
 
+fn classify_eye_tracking_state(
+    face_sources: &interaction::FaceSources,
+    eye_gazes: &[Option<Pose>; 2],
+    pico_eye_tracking: Option<&alvr_packets::EyeTrackingDataPICO>,
+) -> EyeTrackingInputStatus {
+    let has_any_tracker = face_sources.eye_tracker_fb.is_some()
+        || face_sources.face_tracker_pico.is_some()
+        || face_sources.eye_tracker_htc.is_some()
+        || face_sources.combined_eyes_source.is_some();
+
+    if !has_any_tracker {
+        return EyeTrackingInputStatus::Unsupported;
+    }
+
+    let has_tracked_pose = eye_gazes.iter().any(|pose| pose.is_some());
+
+    let pico_gaze_valid = pico_eye_tracking.map_or(false, |data| {
+        eye_pose_status_pico::is_gaze_vector_valid(data.left_eye_pose_status)
+            || eye_pose_status_pico::is_gaze_vector_valid(data.right_eye_pose_status)
+            || eye_pose_status_pico::is_gaze_vector_valid(data.combined_eye_pose_status)
+    });
+
+    if has_tracked_pose || pico_gaze_valid {
+        EyeTrackingInputStatus::Active
+    } else {
+        EyeTrackingInputStatus::Standby
+    }
+}
+
 pub struct StreamContext {
     core_context: Arc<ClientCoreContext>,
     xr_session: xr::Session<xr::OpenGlEs>,
@@ -98,6 +130,10 @@ pub struct StreamContext {
     view_reference_space: Arc<xr::Space>,
     swapchains: [xr::Swapchain<xr::OpenGlEs>; 2],
     last_good_view_params: [ViewParams; 2],
+    // Frame-reuse fix: Cache last valid shift data for use when reusing old frames
+    // Without this, frame reuse during network latency would use (0,0) shift
+    // while the cached frame was encoded with non-zero shift, causing visual glitches
+    last_good_shift: Option<alvr_packets::DynamicFoveatedCenter>,
     input_thread: Option<JoinHandle<()>>,
     input_thread_running: Arc<RelaxedAtomic>,
     config: ParsedStreamConfig,
@@ -246,6 +282,7 @@ impl StreamContext {
             view_reference_space,
             swapchains,
             last_good_view_params: [ViewParams::default(); 2],
+            last_good_shift: None,
             input_thread: None,
             input_thread_running,
             config,
@@ -376,16 +413,34 @@ impl StreamContext {
                 self.last_good_view_params = view_params;
 
                 // 🎯 获取Frame-Perfect绑定的shift数据：与编码时使用的shift完全相同
-                let frame_perfect_shift = self.core_context.get_frame_perfect_shift(timestamp)
-                    .map(|shift| alvr_packets::DynamicFoveatedCenter {
-                        center_shift_x: shift.shift_x,
-                        center_shift_y: shift.shift_y,
-                        sequence_id: Some(shift.sequence_id),
-                    });
+                // DFRv4: Per-eye shift support for proper encode/decode alignment
+                let frame_perfect_shift =
+                    self.core_context
+                        .get_frame_perfect_shift(timestamp)
+                        .map(|shift| alvr_packets::DynamicFoveatedCenter {
+                            center_shift_x: shift.shift_x,
+                            center_shift_y: shift.shift_y,
+                            left_shift_x: shift.left_shift_x,
+                            left_shift_y: shift.left_shift_y,
+                            right_shift_x: shift.right_shift_x,
+                            right_shift_y: shift.right_shift_y,
+                            sequence_id: Some(shift.sequence_id),
+                        });
+
+                // Frame-reuse fix: Cache shift data for use when reusing old frames
+                // This ensures network latency fallback uses correct inverse-FFR parameters
+                self.last_good_shift = frame_perfect_shift.clone();
 
                 (timestamp, view_params, buffer_ptr, frame_perfect_shift)
             } else {
-                (vsync_time, self.last_good_view_params, ptr::null_mut(), None)
+                // Frame reuse path: No new frame available (network latency)
+                // Use cached shift data to match the cached frame's encoding
+                (
+                    vsync_time,
+                    self.last_good_view_params,
+                    ptr::null_mut(),
+                    self.last_good_shift.clone(),
+                )
             };
 
         let left_swapchain_idx = self.swapchains[0].acquire_image().unwrap();
@@ -405,7 +460,10 @@ impl StreamContext {
 
             // Force log every 30 frames with println to bypass debug group filtering
             if RENDER_FRAME_COUNT % 30 == 0 {
-                println!("=== CLIENT FRAME-PERFECT DEBUG Frame {} ===", RENDER_FRAME_COUNT);
+                println!(
+                    "=== CLIENT FRAME-PERFECT DEBUG Frame {} ===",
+                    RENDER_FRAME_COUNT
+                );
 
                 // 🎯 显示Frame-Perfect数据（正确的）
                 if let Some(ref center) = frame_perfect_shift {
@@ -415,8 +473,14 @@ impl StreamContext {
                         " [no-seq]".to_string()
                     };
 
-                    println!("CLIENT FRAME-PERFECT: Frame {} timestamp={:?} - DFR{} shift=({:.3},{:.3})",
-                        RENDER_FRAME_COUNT, timestamp, seq_info, center.center_shift_x, center.center_shift_y);
+                    println!(
+                        "CLIENT FRAME-PERFECT: Frame {} timestamp={:?} - DFR{} shift=({:.3},{:.3})",
+                        RENDER_FRAME_COUNT,
+                        timestamp,
+                        seq_info,
+                        center.center_shift_x,
+                        center.center_shift_y
+                    );
 
                     log::info!(target: alvr_common::CLIENT_GFX_DBG_LABEL,
                         "🎯 FRAME-PERFECT: Frame {} ts={:?} - DFR{} shift=({:.3},{:.3})",
@@ -432,15 +496,28 @@ impl StreamContext {
 
                 // 🎯 对比显示异步配置数据（有问题的旧方式）
                 if let Some(ref async_center) = self.config.dynamic_foveated_center {
-                    println!("CLIENT ASYNC-CONFIG: Frame {} - DFR shift=({:.3},{:.3}) [DEPRECATED]",
-                        RENDER_FRAME_COUNT, async_center.center_shift_x, async_center.center_shift_y);
+                    println!(
+                        "CLIENT ASYNC-CONFIG: Frame {} - DFR shift=({:.3},{:.3}) [DEPRECATED]",
+                        RENDER_FRAME_COUNT,
+                        async_center.center_shift_x,
+                        async_center.center_shift_y
+                    );
                 } else {
-                    println!("CLIENT ASYNC-CONFIG: Frame {} - No async DFR data", RENDER_FRAME_COUNT);
+                    println!(
+                        "CLIENT ASYNC-CONFIG: Frame {} - No async DFR data",
+                        RENDER_FRAME_COUNT
+                    );
                 }
 
                 // CRITICAL: Verify Frame-Perfect data is being passed to renderer
-                println!("CLIENT: About to call renderer.render() with Frame-Perfect shift: {}",
-                    if frame_perfect_shift.is_some() { "PRESENT" } else { "ABSENT" });
+                println!(
+                    "CLIENT: About to call renderer.render() with Frame-Perfect shift: {}",
+                    if frame_perfect_shift.is_some() {
+                        "PRESENT"
+                    } else {
+                        "ABSENT"
+                    }
+                );
             }
         }
 
@@ -638,7 +715,16 @@ fn stream_input_loop(
             now,
             platform,
         );
-        
+
+        let pico_eye_tracking_data =
+            interaction::get_pico_eye_tracking_data(&int_ctx.face_sources, now);
+
+        let eye_tracking_state = classify_eye_tracking_state(
+            &int_ctx.face_sources,
+            &eye_gazes,
+            pico_eye_tracking_data.as_ref(),
+        );
+
         let face_data = FaceData {
             eye_gazes,
             fb_face_expression: interaction::get_fb_face_expression(&int_ctx.face_sources, now).or(
@@ -646,7 +732,8 @@ fn stream_input_loop(
             ),
             htc_eye_expression: interaction::get_htc_eye_expression(&int_ctx.face_sources, now),
             htc_lip_expression: interaction::get_htc_lip_expression(&int_ctx.face_sources, now),
-            pico_eye_tracking_data: interaction::get_pico_eye_tracking_data(&int_ctx.face_sources, now),
+            pico_eye_tracking_data,
+            eye_tracking_state,
         };
 
         if let Some((tracker, joint_count)) = &int_ctx.body_sources.body_tracker_fb {
@@ -670,11 +757,55 @@ fn stream_input_loop(
             device_motions.append(&mut interaction::get_bd_motion_trackers(now, tracker));
         }
 
+        // Collect high-frequency WiFi metrics for DRL-based ABR research
+        let wifi_metrics = {
+            #[cfg(target_os = "android")]
+            {
+                // Use caching to avoid expensive JNI calls at 3x refresh rate
+                static WIFI_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(alvr_system_info::WiFiMetrics, std::time::Instant)>>> = std::sync::OnceLock::new();
+                let cache = WIFI_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+
+                let mut cache_guard = cache.lock().unwrap();
+                let now = std::time::Instant::now();
+
+                // Refresh WiFi data every 100ms to balance performance and responsiveness
+                if cache_guard.is_none() || now.duration_since(cache_guard.as_ref().unwrap().1) > std::time::Duration::from_millis(100) {
+                    if let Some(wifi_data) = alvr_system_info::get_wifi_metrics() {
+                        *cache_guard = Some((wifi_data, now));
+                    }
+                }
+
+                cache_guard.as_ref().map(|(data, _)| {
+                    // Convert from alvr_system_info::WiFiMetrics to alvr_packets::WiFiMetrics
+                    Some(alvr_packets::WiFiMetrics {
+                        timestamp_ns: data.timestamp_ns,
+                        rssi_dbm: data.rssi_dbm,
+                        frequency_mhz: data.frequency_mhz,
+                        link_speed_mbps: data.link_speed_mbps,
+                        mcs_index: None,                   // Not available in current implementation
+                        snr_db: None,                      // Not available in current implementation
+                        tx_bitrate_mbps: None,             // Not available in current implementation
+                        rx_bitrate_mbps: None,             // Not available in current implementation
+                        tx_retries: None,                  // Not available in current implementation
+                        tx_failures: None,                 // Not available in current implementation
+                        wifi_standard: "UNKNOWN".to_string(), // Not fabricating
+                        channel_width: 0,                  // Not fabricating
+                        guard_interval: None,              // Not available in current implementation
+                    })
+                }).flatten()
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                None
+            }
+        };
+
         core_ctx.send_tracking(
             Duration::from_nanos(now.as_nanos() as u64),
             device_motions,
             [left_hand_skeleton, right_hand_skeleton],
             face_data,
+            wifi_metrics,
         );
 
         let button_entries = interaction::update_buttons(&xr_session, &int_ctx.button_actions);

@@ -21,6 +21,8 @@ override EDGE_Y_RATIO: f32 = 0.0;
 
 override CENTER_SIZE_X: f32 = 0.5;
 override CENTER_SIZE_Y: f32 = 0.4;
+override STATIC_CENTER_X: f32 = 0.4;
+override STATIC_CENTER_Y: f32 = 0.1;
 
 override C1_X: f32 = 0.0;
 override C1_Y: f32 = 0.0;
@@ -83,26 +85,38 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         let view_size_ratio = vec2f(VIEW_WIDTH_RATIO, VIEW_HEIGHT_RATIO);
         let edge_ratio = vec2f(EDGE_X_RATIO, EDGE_Y_RATIO);
 
-        // DFRv3: Dynamic center shift calculation
-        // Static FFR center for dual-eye convergence (hardcoded to match server)
-        let static_ffr_center = vec2f(0.4, 0.1);
+        // ===========================================================================
+        // DFR 1.1: Per-eye dynamic center (NOT static_ffr_center + eye_shift)
+        // ===========================================================================
+        // Key insight: For DFR (Dynamic Foveated Rendering), eye_shift IS the center.
+        // static_ffr_center is an experience-based static value for FFR mode,
+        // which is NOT accurate for eye-tracking based DFR.
+        //
+        // When eye tracking is active: eye_shift contains the precise gaze-derived center
+        // When eye tracking fails: eye_shift = (0,0), center at screen middle (safe default)
+        // ===========================================================================
 
-        // Get dynamic eyeShift from ck_channel2.zw (transmitted from server)
-        let eye_shift = pc.ck_channel2.zw;
-
-        // Calculate dynamic final shift
-        // Eye tracking coordinates: Y up (向上看 = positive), WGSL texture: Y down (0=top, 1=bottom)
-        // When looking up (+), FFR center should move up, which means Y decreases in texture coords
-        // So: eye up (+) -> texture center up (-), eye down (-) -> texture center down (+)
-        var dynamic_center_shift = static_ffr_center;
+        // Per-eye shift: ck_channel2 = (left_x, left_y, right_x, right_y)
+        // Select shift based on view_idx for proper encode/decode alignment
+        var eye_shift: vec2f;
         if pc.view_idx == 1u {
-            // Right eye: invert X (horizontal flip), invert Y (coord conversion)
-            dynamic_center_shift.x += -eye_shift.x;
-            dynamic_center_shift.y += -eye_shift.y;  // 向上看(+) -> center上移(-), 向下看(-) -> center下移(+)
+            eye_shift = pc.ck_channel2.zw; // Right eye shift
+        } else {
+            eye_shift = pc.ck_channel2.xy; // Left eye shift
+        }
+
+        // DFR: Use eye_shift directly as FFR center with coordinate conversion
+        // Coordinate system: WGSL texture Y-down (0=top), eye tracking Y-up (positive=looking up)
+        // Transform: Looking up (+gaze_y) -> center moves up -> texture Y decreases (-)
+        var dynamic_center_shift: vec2f;
+        if pc.view_idx == 1u {
+            // Right eye: invert X (texture is horizontally flipped), invert Y (coord conversion)
+            dynamic_center_shift.x = -eye_shift.x;
+            dynamic_center_shift.y = -eye_shift.y;
         } else {
             // Left eye: X as-is, invert Y (coord conversion)
-            dynamic_center_shift.x += eye_shift.x;
-            dynamic_center_shift.y += -eye_shift.y;   // 向上看(+) -> center上移(-), 向下看(-) -> center下移(+)
+            dynamic_center_shift.x = eye_shift.x;
+            dynamic_center_shift.y = -eye_shift.y;
         }
 
         // Dynamic parameter calculation (based on stream.rs logic)
@@ -111,6 +125,7 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         let c1 = (edge_ratio - 1.0) * c0 * (dynamic_center_shift + 1.0) / edge_ratio;
         let c2 = (edge_ratio - 1.0) * center_size + 1.0;
 
+        // Bounds match host-precomputed constants (already account for c2 in lo_bound_c/hi_bound_c)
         let lo_bound = c0 * (dynamic_center_shift + 1.0);
         let hi_bound = c0 * (dynamic_center_shift - 1.0) + 1.0;
         let lo_bound_c = c0 * (dynamic_center_shift + 1.0) / c2;

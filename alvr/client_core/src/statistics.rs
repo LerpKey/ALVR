@@ -1,5 +1,6 @@
 use alvr_common::SlidingWindowAverage;
 use alvr_packets::ClientStatistics;
+use alvr_session::Settings;
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
@@ -21,10 +22,12 @@ pub struct StatisticsManager {
 
 impl StatisticsManager {
     pub fn new(
-        max_history_size: usize,
+        settings: &Settings,
         nominal_server_frame_interval: Duration,
         steamvr_pipeline_frames: f32,
     ) -> Self {
+        let max_history_size = settings.connection.statistics_history_size;
+
         Self {
             max_history_size,
             history_buffer: VecDeque::new(),

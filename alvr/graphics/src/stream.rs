@@ -52,6 +52,19 @@ pub struct StreamRenderer {
     staging_renderer: StagingRenderer,
     pipeline: RenderPipeline,
     views_objects: [ViewObjects; 2],
+    ffe_debug_info: Option<FfeDebugInfo>,
+}
+
+#[derive(Clone, Debug)]
+struct FfeDebugInfo {
+    center_size_aligned: glam::Vec2,
+    edge_ratio: glam::Vec2,
+    c0: glam::Vec2,
+    c1: glam::Vec2,
+    c2: glam::Vec2,
+    lo_bound: glam::Vec2,
+    hi_bound: glam::Vec2,
+    view_ratio_aligned: glam::Vec2,
 }
 
 impl StreamRenderer {
@@ -106,10 +119,13 @@ impl StreamRenderer {
             ("ENCODING_GAMMA".into(), encoding_gamma.into()),
         ]);
 
+        let mut ffe_debug_info = None;
+
         let staging_resolution = if let Some(foveated_encoding) = foveated_encoding {
-            let (staging_resolution, ffe_constants) =
+            let (staging_resolution, ffe_constants, debug_info) =
                 foveated_encoding_shader_constants(base_view_resolution, foveated_encoding);
             constants.extend(ffe_constants);
+            ffe_debug_info = Some(debug_info);
 
             staging_resolution
         } else {
@@ -240,6 +256,7 @@ impl StreamRenderer {
             staging_renderer,
             pipeline,
             views_objects: view_objects.try_into().unwrap(),
+            ffe_debug_info,
         }
     }
 
@@ -255,6 +272,44 @@ impl StreamRenderer {
         // if hardware_buffer is available copy stream to staging texture
         if !hardware_buffer.is_null() {
             self.staging_renderer.render(hardware_buffer);
+        }
+
+        if let (Some(center), Some(debug_info)) = (dynamic_center, &self.ffe_debug_info) {
+            static mut FFE_DEBUG_COUNT: u32 = 0;
+            unsafe {
+                FFE_DEBUG_COUNT += 1;
+                if FFE_DEBUG_COUNT % 120 == 0 {
+                    let seq_info = center
+                        .sequence_id
+                        .map(|id| format!("seq={}", id))
+                        .unwrap_or_else(|| "seq=none".to_string());
+                    alvr_common::debug!(
+                        "CLIENT GRAPHICS: FFE consts {:?} center_size={:.3},{:.3} edge_ratio={:.3},{:.3} c0={:.3},{:.3} c1={:.3},{:.3} c2={:.3},{:.3} lo={:.3},{:.3} hi={:.3},{:.3}",
+                        seq_info,
+                        debug_info.center_size_aligned.x,
+                        debug_info.center_size_aligned.y,
+                        debug_info.edge_ratio.x,
+                        debug_info.edge_ratio.y,
+                        debug_info.c0.x,
+                        debug_info.c0.y,
+                        debug_info.c1.x,
+                        debug_info.c1.y,
+                        debug_info.c2.x,
+                        debug_info.c2.y,
+                        debug_info.lo_bound.x,
+                        debug_info.lo_bound.y,
+                        debug_info.hi_bound.x,
+                        debug_info.hi_bound.y,
+                    );
+                    alvr_common::debug!(
+                        "CLIENT GRAPHICS: FFE shift current=({:.3},{:.3}) view_ratio_aligned={:.3},{:.3}",
+                        center.center_shift_x,
+                        center.center_shift_y,
+                        debug_info.view_ratio_aligned.x,
+                        debug_info.view_ratio_aligned.y
+                    );
+                }
+            }
         }
 
         let mut encoder = self
@@ -429,7 +484,7 @@ fn set_passthrough_push_constants(
         }
     }
 
-    // Set dynamic foveated center for Inverse-FFR
+    // Set dynamic foveated center for Inverse-FFR (per-eye support)
     if let Some(center) = dynamic_center {
         static mut DEBUG_FRAME_COUNT: u32 = 0;
         unsafe {
@@ -438,25 +493,39 @@ fn set_passthrough_push_constants(
 
         match config {
             None | Some(PassthroughMode::Blend { .. }) => {
-                // Use ck_channel2.zw for dynamic FFR center when chroma key is not active
-                let shift_x = center.center_shift_x;
-                let shift_y = center.center_shift_y;
+                // Per-eye shift support: ck_channel2 = (left_x, left_y, right_x, right_y)
+                // Shader selects based on view_idx
+                let left_shift_x = center.left_shift_x;
+                let left_shift_y = center.left_shift_y;
+                let right_shift_x = center.right_shift_x;
+                let right_shift_y = center.right_shift_y;
 
                 // Debug logging for Inverse-FFR processing
                 unsafe {
                     if DEBUG_FRAME_COUNT % 60 == 0 {
-                        alvr_common::debug!("CLIENT GRAPHICS: Inverse-FFR Frame {} Eye {} - shift=({:.3}, {:.3})",
-                            DEBUG_FRAME_COUNT, view_idx, shift_x, shift_y);
+                        alvr_common::debug!(
+                            "CLIENT GRAPHICS: Inverse-FFR Frame {} Eye {} - L=({:.3},{:.3}) R=({:.3},{:.3})",
+                            DEBUG_FRAME_COUNT,
+                            view_idx,
+                            left_shift_x,
+                            left_shift_y,
+                            right_shift_x,
+                            right_shift_y
+                        );
                         if let Some(seq_id) = center.sequence_id {
-                            alvr_common::debug!("CLIENT GRAPHICS: Using synchronized data seq={}", seq_id);
+                            alvr_common::debug!(
+                                "CLIENT GRAPHICS: Using synchronized data seq={}",
+                                seq_id
+                            );
                         }
                     }
                 }
 
+                // Pack per-eye shift into ck_channel2: (left_x, left_y, right_x, right_y)
                 set_vec4(
                     render_pass,
                     CK_CHANNEL2_CONST_OFFSET,
-                    Vec4::new(0.0, 0.0, shift_x, shift_y),
+                    Vec4::new(left_shift_x, left_shift_y, right_shift_x, right_shift_y),
                 );
             }
             Some(PassthroughMode::RgbChromaKey(_)) | Some(PassthroughMode::HsvChromaKey(_)) => {
@@ -469,11 +538,26 @@ fn set_passthrough_push_constants(
         }
     } else {
         // No DFR data available - this is normal for FFR mode
+        // CRITICAL: Must initialize ck_channel2 to (0,0,0,0) to avoid using stale values
+        // When eye_shift = (0,0), inverse-FFR center is at screen middle (safe default)
+        match config {
+            None | Some(PassthroughMode::Blend { .. }) => {
+                // Initialize ck_channel2 to zero for FFR mode (no dynamic shift)
+                set_vec4(render_pass, CK_CHANNEL2_CONST_OFFSET, Vec4::ZERO);
+            }
+            Some(PassthroughMode::RgbChromaKey(_)) | Some(PassthroughMode::HsvChromaKey(_)) => {
+                // Chroma key mode: ck_channel2 is used by chroma key, already set above
+            }
+        }
+
         static mut NO_DFR_DEBUG_COUNT: u32 = 0;
         unsafe {
             NO_DFR_DEBUG_COUNT += 1;
-            if NO_DFR_DEBUG_COUNT % 120 == 0 { // Log less frequently
-                alvr_common::debug!("CLIENT GRAPHICS: No DFR data - using static FFR (normal)");
+            if NO_DFR_DEBUG_COUNT % 120 == 0 {
+                // Log less frequently
+                alvr_common::debug!(
+                    "CLIENT GRAPHICS: No DFR data - using static FFR (ck_channel2 zeroed)"
+                );
             }
         }
     }
@@ -482,7 +566,7 @@ fn set_passthrough_push_constants(
 pub fn foveated_encoding_shader_constants(
     expanded_view_resolution: UVec2,
     config: FoveatedEncodingConfig,
-) -> (UVec2, HashMap<String, f64>) {
+) -> (UVec2, HashMap<String, f64>, FfeDebugInfo) {
     let view_resolution = expanded_view_resolution.as_vec2();
 
     let center_size = glam::vec2(config.center_size_x, config.center_size_y);
@@ -511,9 +595,16 @@ pub fn foveated_encoding_shader_constants(
     let c1 = (edge_ratio - 1.) * c0 * (center_shift_aligned + 1.) / edge_ratio;
     let c2 = (edge_ratio - 1.) * center_size_aligned + 1.;
 
-    let lo_bound = c0 * (center_shift_aligned + 1.);
+    // CRITICAL: Two coordinate spaces must be maintained separately:
+    // - lo_bound/hi_bound: Compressed UV space (for region boundary checks)
+    // - lo_bound_c/hi_bound_c: Original UV space (for inverse polynomial coefficients)
+    //
+    // Server FFR.cpp uses loBound = c0*(shift+1)/c2 in ORIGINAL space for compression.
+    // Client needs COMPRESSED space boundaries for region判断: when originalUV = c0*(shift+1)/c2,
+    // the compressed result is c0*(shift+1). Thus:
+    let lo_bound = c0 * (center_shift_aligned + 1.);  // Compressed space
     let hi_bound = c0 * (center_shift_aligned - 1.) + 1.;
-    let lo_bound_c = c0 * (center_shift_aligned + 1.) / c2;
+    let lo_bound_c = c0 * (center_shift_aligned + 1.) / c2;  // Original space
     let hi_bound_c = c0 * (center_shift_aligned - 1.) / c2 + 1.;
 
     let a_left = c2 * (1. - edge_ratio) / (edge_ratio * lo_bound_c);
@@ -533,8 +624,13 @@ pub fn foveated_encoding_shader_constants(
         ("VIEW_HEIGHT_RATIO", view_ratio_aligned.y),
         ("EDGE_X_RATIO", edge_ratio.x),
         ("EDGE_Y_RATIO", edge_ratio.y),
-        ("CENTER_SIZE_X", config.center_size_x),
-        ("CENTER_SIZE_Y", config.center_size_y),
+        // CRITICAL: Use aligned center_size to match server-side FFR.cpp calculation
+        // Server uses centerSizeAligned (32-pixel boundary aligned), client must match
+        // to avoid pixel-level jitter at foveation zone boundaries
+        ("CENTER_SIZE_X", center_size_aligned.x),
+        ("CENTER_SIZE_Y", center_size_aligned.y),
+        ("STATIC_CENTER_X", center_shift_aligned.x),
+        ("STATIC_CENTER_Y", center_shift_aligned.y),
         ("C1_X", c1.x),
         ("C1_Y", c1.y),
         ("C2_X", c2.x),
@@ -558,7 +654,22 @@ pub fn foveated_encoding_shader_constants(
     .map(|(k, v)| ((*k).to_string(), *v as f64))
     .collect();
 
-    (optimized_view_resolution_aligned.as_uvec2(), constants)
+    let debug_info = FfeDebugInfo {
+        center_size_aligned,
+        edge_ratio,
+        c0,
+        c1,
+        c2,
+        lo_bound,
+        hi_bound,
+        view_ratio_aligned,
+    };
+
+    (
+        optimized_view_resolution_aligned.as_uvec2(),
+        constants,
+        debug_info,
+    )
 }
 
 pub fn compute_target_view_resolution(

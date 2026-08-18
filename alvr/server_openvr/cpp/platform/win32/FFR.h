@@ -6,6 +6,8 @@
 extern "C" {
     struct DFRShiftParams {
         float shift_x, shift_y;
+        float left_shift_x, left_shift_y;
+        float right_shift_x, right_shift_y;
         bool is_eye_tracked;
     };
     DFRShiftParams get_eye_tracked_ffr_shift();

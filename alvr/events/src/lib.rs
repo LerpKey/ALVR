@@ -1,5 +1,5 @@
 use alvr_common::{info, DeviceMotion, LogEntry, LogSeverity, Pose};
-use alvr_packets::{AudioDevicesList, ButtonValue};
+use alvr_packets::{AudioDevicesList, ButtonValue, EyeTrackingDataPICO};
 use alvr_session::SessionConfig;
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, time::Duration};
@@ -60,6 +60,7 @@ pub struct TrackingEvent {
     pub fb_face_expression: Option<Vec<f32>>,
     pub htc_eye_expression: Option<Vec<f32>>,
     pub htc_lip_expression: Option<Vec<f32>>,
+    pub pico_eye_tracking_data: Option<EyeTrackingDataPICO>, // PICO eye tracking data
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

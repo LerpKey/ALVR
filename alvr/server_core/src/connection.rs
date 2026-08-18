@@ -3,7 +3,7 @@ use crate::{
     hand_gestures::HandGestureManager,
     input_mapping::ButtonMappingManager,
     sockets::WelcomeSocket,
-    statistics::StatisticsManager,
+    statistics::{StateLogPayload, StatisticsManager, STATE_LOG_TARGET_HZ},
     tracking::{self, eye_tracked_ffr, TrackingManager},
     ConnectionContext, ServerCoreEvent, ViewsConfig, FILESYSTEM_LAYOUT, SESSION_MANAGER,
 };
@@ -19,9 +19,10 @@ use alvr_common::{
 };
 use alvr_events::{AdbEvent, ButtonEvent, EventType};
 use alvr_packets::{
-    ClientConnectionResult, ClientControlPacket, ClientListAction, ClientStatistics,
-    DynamicFoveatedCenter, NegotiatedStreamingConfig, RealTimeConfig, ReservedClientControlPacket,
-    ServerControlPacket, Tracking, VideoPacketHeader, AUDIO, HAPTICS, STATISTICS, TRACKING, VIDEO,
+    eye_pose_status_pico, ClientConnectionResult, ClientControlPacket, ClientListAction,
+    ClientStatistics, DynamicFoveatedCenter, NegotiatedStreamingConfig, RealTimeConfig,
+    ReservedClientControlPacket, ServerControlPacket, Tracking, VideoPacketHeader, AUDIO, HAPTICS,
+    STATISTICS, TRACKING, VIDEO,
 };
 use alvr_session::{
     BodyTrackingBDConfig, BodyTrackingSinkConfig, CodecType, ControllersEmulationMode, FrameSize,
@@ -37,7 +38,7 @@ use std::{
     process::Command,
     sync::{mpsc::RecvTimeoutError, Arc},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const RETRY_CONNECT_MIN_INTERVAL: Duration = Duration::from_secs(1);
@@ -62,6 +63,34 @@ fn is_streaming(client_hostname: &str) -> bool {
         .client_list()
         .get(client_hostname)
         .is_some_and(|c| c.connection_state == ConnectionState::Streaming)
+}
+
+/// Calculate pose delta between current and rendered pose for ATW analysis.
+/// Returns (position_delta, orientation_delta_deg).
+/// Position delta is Euclidean distance in OpenXR units.
+/// Orientation delta is angular difference in degrees.
+fn calculate_pose_delta(
+    current: &alvr_common::DeviceMotion,
+    rendered: &alvr_common::DeviceMotion,
+) -> (f32, f32) {
+    // Position: Euclidean distance
+    let pos_delta = {
+        let dx = current.pose.position.x - rendered.pose.position.x;
+        let dy = current.pose.position.y - rendered.pose.position.y;
+        let dz = current.pose.position.z - rendered.pose.position.z;
+        (dx * dx + dy * dy + dz * dz).sqrt()
+    };
+
+    // Orientation: Angular difference in degrees
+    let ori_delta_deg = {
+        let q1 = &rendered.pose.orientation;
+        let q2 = &current.pose.orientation;
+        let dot = (q1.x * q2.x + q1.y * q2.y + q1.z * q2.z + q1.w * q2.w).abs();
+        let angle_rad = 2.0 * dot.min(1.0).acos();
+        angle_rad.to_degrees()
+    };
+
+    (pos_delta, ori_delta_deg)
 }
 
 pub fn contruct_openvr_config(session: &SessionConfig) -> OpenvrConfig {
@@ -141,6 +170,11 @@ pub fn contruct_openvr_config(session: &SessionConfig) -> OpenvrConfig {
     } else {
         false
     };
+
+    eye_tracked_ffr::set_static_ffr_center(Vec2::new(
+        foveation_center_shift_x,
+        foveation_center_shift_y,
+    ));
 
     let mut brightness = 0.0;
     let mut contrast = 0.0;
@@ -821,7 +855,7 @@ fn connection_pipeline(
     dbg_connection!("connection_pipeline: Got StreamReady packet");
 
     *ctx.statistics_manager.write() = Some(StatisticsManager::new(
-        initial_settings.connection.statistics_history_size,
+        &initial_settings,
         Duration::from_secs_f32(1.0 / fps),
         if let Switch::Enabled(config) = &initial_settings.headset.controllers {
             config.steamvr_pipeline_frames
@@ -829,6 +863,12 @@ fn connection_pipeline(
             0.0
         },
     ));
+
+    if let Some(stats) = ctx.statistics_manager.read().as_ref() {
+        if let Some(metadata) = stats.dataset_session_metadata() {
+            ctx.init_dataset_video(metadata);
+        }
+    }
 
     *ctx.bitrate_manager.lock() =
         BitrateManager::new(initial_settings.video.bitrate.history_size, fps);
@@ -1059,8 +1099,29 @@ fn connection_pipeline(
 
                 if let Some(stats) = &mut *ctx.statistics_manager.write() {
                     let timestamp = client_stats.target_timestamp;
+
+                    // --- START MODIFICATION ---
+                    let (head_motion, pico_eye_tracking_data) = {
+                        let tracking_manager = ctx.tracking_manager.read();
+                        (
+                            tracking_manager.get_device_motion(*alvr_common::HEAD_ID, timestamp),
+                            tracking_manager
+                                .get_face_data()
+                                .pico_eye_tracking_data
+                                .clone(),
+                        )
+                    };
+                    // drop the lock as soon as we don't need it
+                    // --- END MODIFICATION ---
+
+                    // Cache rendered pose for ATW delta calculation in State Log
+                    if let Some(ref motion) = head_motion {
+                        ctx.tracking_manager.write().cache_rendered_pose(motion.clone());
+                    }
+
                     let decoder_latency = client_stats.video_decode;
-                    let (network_latency, game_latency) = stats.report_statistics(client_stats);
+                    let (network_latency, game_latency) =
+                        stats.report_statistics(client_stats, head_motion, pico_eye_tracking_data); // MODIFIED
 
                     ctx.events_sender
                         .send(ServerCoreEvent::GameRenderLatencyFeedback(game_latency))
@@ -1073,6 +1134,212 @@ fn connection_pipeline(
                         network_latency,
                         decoder_latency,
                     );
+                }
+            }
+        }
+    });
+
+    // ========================================================================
+    // State Log Thread (90Hz tick sampling)
+    // Strictly timed sampling of head pose, eye tracking, and server state
+    // ========================================================================
+    let state_log_thread = thread::spawn({
+        let ctx = Arc::clone(&ctx);
+        let client_hostname = client_hostname.clone();
+        move || {
+            // Check if state log is enabled
+            let state_log_enabled = ctx
+                .statistics_manager
+                .read()
+                .as_ref()
+                .is_some_and(|s| s.is_state_log_enabled());
+
+            if !state_log_enabled {
+                return;
+            }
+
+            let state_log_interval = Duration::from_secs_f32(1.0 / STATE_LOG_TARGET_HZ);
+            let mut next_tick = Instant::now();
+            // Track monotonic time base for relative timing
+            let monotonic_base = Instant::now();
+
+            while is_streaming(&client_hostname) {
+                let now = Instant::now();
+
+                // Wait until next tick
+                if now < next_tick {
+                    thread::sleep(next_tick.saturating_duration_since(now));
+                }
+                next_tick += state_log_interval;
+
+                // Sample timestamp
+                let sample_now = Instant::now();
+                let system_unix_time_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let monotonic_time_ns = sample_now
+                    .saturating_duration_since(monotonic_base)
+                    .as_nanos() as u64;
+
+                // Sample head motion, eye tracking, and cached rendered pose from TrackingManager
+                // raw_head_motion: original pose before prediction (for head_* fields)
+                // predicted_head_motion: after linear extrapolation (for pose_delta comparison)
+                let (
+                    raw_head_motion,
+                    raw_head_age_ms,
+                    predicted_head_motion,
+                    face_data,
+                    eye_age_ms,
+                    cached_rendered_pose,
+                ) = {
+                    let tracking_manager = ctx.tracking_manager.read();
+                    let (raw_motion, raw_age) =
+                        tracking_manager.get_latest_raw_head_motion_with_age(sample_now);
+                    let (predicted_motion, _predicted_age) =
+                        tracking_manager.get_latest_head_motion_with_age(sample_now);
+                    let (face_data, eye_age) =
+                        tracking_manager.get_face_data_with_age(sample_now);
+                    let cached_rendered = tracking_manager.get_cached_rendered_pose().cloned();
+                    (
+                        raw_motion,
+                        raw_age,
+                        predicted_motion,
+                        face_data.pico_eye_tracking_data.clone(),
+                        eye_age,
+                        cached_rendered,
+                    )
+                };
+
+                // Sample server state from StatisticsManager
+                let (server_fps, server_fps_age_ms) = {
+                    if let Some(stats) = ctx.statistics_manager.read().as_ref() {
+                        let fps = stats.get_server_fps();
+                        let age = sample_now
+                            .saturating_duration_since(stats.get_last_frame_present_instant())
+                            .as_secs_f32()
+                            * 1000.0;
+                        (fps, age)
+                    } else {
+                        (0.0, f32::MAX)
+                    }
+                };
+
+                // Build state log payload
+                // head_* uses raw motion (before prediction) for actual pose data
+                let (head_position, head_orientation, head_valid) =
+                    if let Some(ref motion) = raw_head_motion {
+                        (
+                            motion.pose.position.to_array(),
+                            motion.pose.orientation.to_array(),
+                            true,
+                        )
+                    } else {
+                        ([0.0; 3], [0.0, 0.0, 0.0, 1.0], false)
+                    };
+
+                // Extract rendered pose and calculate delta for ATW analysis
+                let (rendered_head_position, rendered_head_orientation, rendered_head_valid) =
+                    match &cached_rendered_pose {
+                        Some(motion) => (
+                            motion.pose.position.to_array(),
+                            motion.pose.orientation.to_array(),
+                            true,
+                        ),
+                        None => ([0.0; 3], [0.0, 0.0, 0.0, 1.0], false),
+                    };
+
+                // pose_delta: raw (actual) vs predicted = prediction displacement
+                // This shows how much the linear extrapolation moved the pose
+                let (pose_delta_position, pose_delta_orientation_deg) =
+                    match (&raw_head_motion, &predicted_head_motion) {
+                        (Some(raw), Some(predicted)) => calculate_pose_delta(raw, predicted),
+                        _ => (-1.0, -1.0), // Sentinel for invalid data
+                    };
+
+                let (
+                    left_gaze_vector,
+                    right_gaze_vector,
+                    left_eye_openness,
+                    right_eye_openness,
+                    left_pupil_dilation,
+                    right_pupil_dilation,
+                    left_gaze_vector_valid,
+                    right_gaze_vector_valid,
+                    left_eye_openness_valid,
+                    right_eye_openness_valid,
+                    left_pupil_dilation_valid,
+                    right_pupil_dilation_valid,
+                    eye_source_time,
+                ) = if let Some(eye_data) = &face_data {
+                    (
+                        eye_data.left_eye_gaze_vector,
+                        eye_data.right_eye_gaze_vector,
+                        eye_data.left_eye_openness,
+                        eye_data.right_eye_openness,
+                        eye_data.left_eye_pupil_dilation,
+                        eye_data.right_eye_pupil_dilation,
+                        eye_pose_status_pico::is_gaze_vector_valid(eye_data.left_eye_pose_status),
+                        eye_pose_status_pico::is_gaze_vector_valid(eye_data.right_eye_pose_status),
+                        eye_pose_status_pico::is_eye_openness_valid(eye_data.left_eye_pose_status),
+                        eye_pose_status_pico::is_eye_openness_valid(eye_data.right_eye_pose_status),
+                        eye_pose_status_pico::is_pupil_dilation_valid(eye_data.left_eye_pose_status),
+                        eye_pose_status_pico::is_pupil_dilation_valid(
+                            eye_data.right_eye_pose_status,
+                        ),
+                        eye_data.time,
+                    )
+                } else {
+                    (
+                        [0.0; 3],
+                        [0.0; 3],
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        false,
+                        false,
+                        false,
+                        false,
+                        false,
+                        false,
+                        0,
+                    )
+                };
+
+                let payload = StateLogPayload {
+                    system_unix_time_ms,
+                    monotonic_time_ns,
+                    head_position,
+                    head_orientation,
+                    head_age_ms: raw_head_age_ms,
+                    head_valid,
+                    left_gaze_vector,
+                    right_gaze_vector,
+                    left_eye_openness,
+                    right_eye_openness,
+                    left_pupil_dilation,
+                    right_pupil_dilation,
+                    left_gaze_vector_valid,
+                    right_gaze_vector_valid,
+                    left_eye_openness_valid,
+                    right_eye_openness_valid,
+                    left_pupil_dilation_valid,
+                    right_pupil_dilation_valid,
+                    eye_age_ms,
+                    eye_source_time,
+                    server_fps,
+                    server_fps_age_ms,
+                    rendered_head_position,
+                    rendered_head_orientation,
+                    rendered_head_valid,
+                    pose_delta_position,
+                    pose_delta_orientation_deg,
+                };
+
+                // Submit to state log worker
+                if let Some(stats) = ctx.statistics_manager.read().as_ref() {
+                    stats.submit_state_log(payload);
                 }
             }
         }
@@ -1098,6 +1365,10 @@ fn connection_pipeline(
                     config.dynamic_foveated_center = Some(DynamicFoveatedCenter {
                         center_shift_x: sync_dfr_shift.shift_x,
                         center_shift_y: sync_dfr_shift.shift_y,
+                        left_shift_x: sync_dfr_shift.left_shift_x,
+                        left_shift_y: sync_dfr_shift.left_shift_y,
+                        right_shift_x: sync_dfr_shift.right_shift_x,
+                        right_shift_y: sync_dfr_shift.right_shift_y,
                         sequence_id: Some(eye_tracked_ffr::get_synchronized_sequence_id()),
                     });
                 }
@@ -1413,8 +1684,7 @@ fn connection_pipeline(
     }
 
     if initial_settings.extra.capture.startup_video_recording {
-        info!("Creating recording file");
-        crate::create_recording_file(&ctx, session_manager_lock.settings());
+        crate::create_recording_file(&ctx, &initial_settings, None);
     }
 
     session_manager_lock.update_client_list(
@@ -1435,6 +1705,7 @@ fn connection_pipeline(
     *ctx.haptics_sender.lock() = None;
 
     *ctx.video_recording_file.lock() = None;
+    ctx.finalize_dataset_video();
 
     session_manager_lock.update_client_list(
         client_hostname,
@@ -1472,6 +1743,7 @@ fn connection_pipeline(
     microphone_thread.join().ok();
     tracking_receive_thread.join().ok();
     statistics_thread.join().ok();
+    state_log_thread.join().ok();
     real_time_update_thread.join().ok();
     control_receive_thread.join().ok();
     stream_receive_thread.join().ok();

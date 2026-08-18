@@ -17,24 +17,33 @@ float4 main(float2 uv : TEXCOORD0) : SV_Target {
 	float2 eyeUV = TextureToEyeUV(uv, isRightEye) / eyeSizeRatio;
 
 
-	// DFR v3: Separate static FFR center and dynamic eye shift
-	// Static FFR center for dual-eye convergence (hardcoded for compatibility)
-	const float2 staticFFRCenter = float2(0.4, 0.1);
+	// ==============================================================================
+	// DFR 1.1: Per-eye dynamic center (NOT staticFFRCenter + eyeShift)
+	// ==============================================================================
+	// Key insight: For DFR (Dynamic Foveated Rendering), eyeShift IS the center.
+	// staticFFRCenter (baseCenterL/R) is an experience-based static value for FFR mode,
+	// which is NOT accurate for eye-tracking based DFR.
+	//
+	// When eye tracking is active: eyeShift contains the precise gaze-derived center
+	// When eye tracking fails: eyeShift = (0,0), center at screen middle (safe default)
+	// ==============================================================================
 
-	// centerShift now carries dynamic eyeShift data
-	float2 eyeShift = centerShift;
+	// Select per-eye shift data
+	float2 eyeShift = isRightEye ? eyeShiftR : eyeShiftL;
 
-	// Calculate final shift: static FFR + dynamic eye tracking with coordinate system conversion
+
 	// HLSL texture coords: Y down, Eye tracking: Y up -> need Y inversion
-	// Left eye: staticFFRCenter + eyeShift (Y inverted)
-	// Right eye: staticFFRCenter + eyeShift (X and Y inverted)
-	float2 finalShift = staticFFRCenter;
+
+	//float2 finalShift = staticFFRCenter;
+	float2 finalShift = float2(0., 0.);// Initialize 不缺定可以这样吗，这里应该分别考虑FFR和DFR两种情况
 	if (isRightEye) {
-		finalShift.x += -eyeShift.x;  // Right eye: invert X shift due to horizontal flip
-		finalShift.y += -eyeShift.y;  // Right eye: invert Y shift (HLSL Y-down vs eye-tracking Y-up)
+		// Right eye: invert X (texture is horizontally flipped), invert Y (coord conversion)
+		finalShift.x = -eyeShift.x;
+		finalShift.y = -eyeShift.y;
 	} else {
-		finalShift.x += eyeShift.x;   // Left eye: X shift as-is
-		finalShift.y += -eyeShift.y;  // Left eye: invert Y shift (HLSL Y-down vs eye-tracking Y-up)
+		// Left eye: X as-is, invert Y (coord conversion)
+		finalShift.x = eyeShift.x;
+		finalShift.y = -eyeShift.y;
 	}
 
 	float2 c0 = (1. - centerSize) / 2.;

@@ -3,7 +3,7 @@ use alvr_packets::EyeTrackingDataPICO;
 use openxr::{self as xr, sys};
 
 const TRACKING_MODE_FACE_BIT: u64 = 0x00000008;
-const TRACKING_MODE_EYE_BIT: u64 =  0x00000004;
+const TRACKING_MODE_EYE_BIT: u64 = 0x00000004;
 const PICO_FACE_EXPRESSION_COUNT: usize = 52;
 
 #[repr(C)]
@@ -15,7 +15,6 @@ struct FaceTrackingDataPICO {
     emotion_probability: [f32; 10],
     reserved: [f32; 128],
 }
-
 
 type StartEyeTrackingPICO = unsafe extern "system" fn(sys::Session) -> sys::Result;
 
@@ -30,11 +29,8 @@ type GetFaceTrackingDataPICO = unsafe extern "system" fn(
     *mut FaceTrackingDataPICO,
 ) -> sys::Result;
 
-type GetEyeTrackingDataPICO = unsafe extern "system" fn(
-    sys::Session,
-    sys::Time,
-    *mut EyeTrackingDataPICO,
-) -> sys::Result;
+type GetEyeTrackingDataPICO =
+    unsafe extern "system" fn(sys::Session, sys::Time, *mut EyeTrackingDataPICO) -> sys::Result;
 
 pub struct FaceTrackerPico {
     session: xr::Session<xr::AnyGraphics>,
@@ -49,12 +45,14 @@ impl FaceTrackerPico {
     pub fn new<G>(session: xr::Session<G>) -> xr::Result<Self> {
         // PICO has its own eye tracking API that doesn't require ext_eye_gaze_interaction
         // We'll try to get the function pointers directly
-        
+
         // Check if eye gaze interaction is available (optional for PICO)
         if let Some(_ext) = session.instance().exts().ext_eye_gaze_interaction {
             println!("OpenXR Eye Gaze Interaction extension is available");
         } else {
-            println!("OpenXR Eye Gaze Interaction extension not available, trying PICO-specific API");
+            println!(
+                "OpenXR Eye Gaze Interaction extension not available, trying PICO-specific API"
+            );
         }
 
         // Try to get PICO-specific function pointers
@@ -62,13 +60,13 @@ impl FaceTrackerPico {
             Ok(ptr) => {
                 println!("Successfully loaded xrStartEyeTrackingPICO");
                 ptr
-            },
+            }
             Err(e) => {
                 println!("Failed to load xrStartEyeTrackingPICO: {:?}", e);
                 return Err(e);
             }
         };
-        
+
         let stop_eye_tracking = get_instance_proc(&session, "xrStopEyeTrackingPICO")?;
         let set_tracking_mode = get_instance_proc(&session, "xrSetTrackingModePICO")?;
         let get_face_tracking_data = get_instance_proc(&session, "xrGetFaceTrackingDataPICO")?;
@@ -76,7 +74,7 @@ impl FaceTrackerPico {
             Ok(ptr) => {
                 println!("Successfully loaded xrGetEyeTrackingDataPICO");
                 ptr
-            },
+            }
             Err(e) => {
                 println!("Failed to load xrGetEyeTrackingDataPICO: {:?}", e);
                 return Err(e);
@@ -155,22 +153,35 @@ impl FaceTrackerPico {
                 // Add diagnostic logging for data validation
                 static mut LAST_TIME: u64 = 0;
                 static mut CALL_COUNT: u32 = 0;
-                
+
                 CALL_COUNT += 1;
-                
+
                 if eye_tracking_data.time == LAST_TIME {
-                    if CALL_COUNT % 60 == 0 {  // Log every 60 calls to avoid spam
-                        println!("Warning: PICO eye tracking timestamp not changing: {} (call #{})", 
-                                eye_tracking_data.time, CALL_COUNT);
-                        println!("  Left status: {:012b} ({})", eye_tracking_data.left_eye_pose_status, eye_tracking_data.left_eye_pose_status);
-                        println!("  Right status: {:012b} ({})", eye_tracking_data.right_eye_pose_status, eye_tracking_data.right_eye_pose_status);
+                    if CALL_COUNT % 60 == 0 {
+                        // Log every 60 calls to avoid spam
+                        println!(
+                            "Warning: PICO eye tracking timestamp not changing: {} (call #{})",
+                            eye_tracking_data.time, CALL_COUNT
+                        );
+                        println!(
+                            "  Left status: {:012b} ({})",
+                            eye_tracking_data.left_eye_pose_status,
+                            eye_tracking_data.left_eye_pose_status
+                        );
+                        println!(
+                            "  Right status: {:012b} ({})",
+                            eye_tracking_data.right_eye_pose_status,
+                            eye_tracking_data.right_eye_pose_status
+                        );
                     }
                 } else {
-                    println!("PICO eye tracking timestamp changed: {} -> {} (call #{})", 
-                            LAST_TIME, eye_tracking_data.time, CALL_COUNT);
+                    println!(
+                        "PICO eye tracking timestamp changed: {} -> {} (call #{})",
+                        LAST_TIME, eye_tracking_data.time, CALL_COUNT
+                    );
                 }
                 LAST_TIME = eye_tracking_data.time;
-                
+
                 Ok(Some(eye_tracking_data))
             } else {
                 println!("PICO eye tracking data has zero timestamp, skipping");
@@ -193,7 +204,7 @@ impl FaceTrackerPico {
     pub fn start_eye_tracking(&self) -> xr::Result<()> {
         unsafe {
             println!("Starting PICO eye tracking...");
-            
+
             // First start eye tracking
             match super::xr_res((self.start_eye_tracking)(self.session.as_raw())) {
                 Ok(_) => println!("✅ Successfully called xrStartEyeTrackingPICO"),
@@ -202,16 +213,19 @@ impl FaceTrackerPico {
                     return Err(e);
                 }
             }
-            
+
             // Then set the tracking mode
             match super::xr_res((self.set_tracking_mode)(
                 self.session.as_raw(),
                 TRACKING_MODE_EYE_BIT,
             )) {
                 Ok(_) => {
-                    println!("✅ Successfully set eye tracking mode ({})", TRACKING_MODE_EYE_BIT);
+                    println!(
+                        "✅ Successfully set eye tracking mode ({})",
+                        TRACKING_MODE_EYE_BIT
+                    );
                     Ok(())
-                },
+                }
                 Err(e) => {
                     println!("❌ Failed to set eye tracking mode: {:?}", e);
                     Err(e)

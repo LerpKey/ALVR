@@ -4,7 +4,7 @@ use alvr_common::{
     parking_lot::RwLock,
     DeviceMotion, Fov, Pose, RelaxedAtomic, HEAD_ID,
 };
-use alvr_packets::{FaceData, ViewParams};
+use alvr_packets::{EyeTrackingInputStatus, FaceData, ViewParams};
 use alvr_session::CodecType;
 use eframe::{
     egui::{CentralPanel, Context, RichText, Slider, ViewportBuilder},
@@ -189,7 +189,10 @@ fn tracking_thread(
                 fb_face_expression: None,
                 htc_eye_expression: None,
                 htc_lip_expression: None,
+                pico_eye_tracking_data: None,
+                eye_tracking_state: EyeTrackingInputStatus::Unsupported,
             },
+            None,
         );
 
         drop(input_lock);

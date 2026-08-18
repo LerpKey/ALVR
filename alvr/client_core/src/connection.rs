@@ -15,8 +15,8 @@ use alvr_common::{
     Pose, RelaxedAtomic, ALVR_VERSION,
 };
 use alvr_packets::{
-    ClientConnectionResult, ClientControlPacket, ClientStatistics, DFRShiftData, Haptics, RealTimeConfig,
-    ServerControlPacket, StreamConfigPacket, Tracking, VideoPacketHeader,
+    ClientConnectionResult, ClientControlPacket, ClientStatistics, DFRShiftData, Haptics,
+    RealTimeConfig, ServerControlPacket, StreamConfigPacket, Tracking, VideoPacketHeader,
     VideoStreamingCapabilities, ViewParams, AUDIO, HAPTICS, STATISTICS, TRACKING, VIDEO,
 };
 use alvr_session::{settings_schema::Switch, SocketProtocol};
@@ -210,14 +210,16 @@ fn connection_pipeline(
     *ctx.velocities_multiplier.write() = settings.extra.velocities_multiplier;
     *ctx.max_prediction.write() = Duration::from_millis(settings.headset.max_prediction_ms);
 
+    let steamvr_pipeline_frames = if let Switch::Enabled(config) = &settings.headset.controllers {
+        config.steamvr_pipeline_frames
+    } else {
+        0.0
+    };
+
     *ctx.statistics_manager.lock() = Some(StatisticsManager::new(
-        settings.connection.statistics_history_size,
+        &settings,
         Duration::from_secs_f32(1.0 / negotiated_config.refresh_rate_hint),
-        if let Switch::Enabled(config) = settings.headset.controllers {
-            config.steamvr_pipeline_frames
-        } else {
-            0.0
-        },
+        steamvr_pipeline_frames,
     ));
 
     let (mut control_sender, mut control_receiver) = proto_control_socket
@@ -313,7 +315,8 @@ fn connection_pipeline(
 
                     // 清理过期数据，防止内存无限增长（保留最近100帧）
                     if cache_guard.len() > 100 {
-                        let oldest_keys: Vec<Duration> = cache_guard.keys().take(50).cloned().collect();
+                        let oldest_keys: Vec<Duration> =
+                            cache_guard.keys().take(50).cloned().collect();
                         for key in oldest_keys {
                             cache_guard.remove(&key);
                         }
@@ -324,8 +327,11 @@ fn connection_pipeline(
                         alvr_common::debug!("🎯 CLIENT_FRAME_PERFECT: Cached DFR shift [ts={:?}, seq={}] ({:.3},{:.3})",
                                           header.timestamp, dfr_shift.sequence_id, dfr_shift.shift_x, dfr_shift.shift_y);
                     } else {
-                        alvr_common::debug!("🎯 CLIENT_FRAME_PERFECT: Cached FFR default [ts={:?}, seq={}]",
-                                          header.timestamp, dfr_shift.sequence_id);
+                        alvr_common::debug!(
+                            "🎯 CLIENT_FRAME_PERFECT: Cached FFR default [ts={:?}, seq={}]",
+                            header.timestamp,
+                            dfr_shift.sequence_id
+                        );
                     }
                 } else {
                     // 没有shift数据时也要记录，用于FFR模式
