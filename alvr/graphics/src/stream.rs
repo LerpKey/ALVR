@@ -250,6 +250,7 @@ impl StreamRenderer {
         hardware_buffer: *mut c_void,
         view_params: [StreamViewParams; 2],
         passthrough: Option<&PassthroughMode>,
+        dynamic_center: Option<&alvr_packets::DynamicFoveatedCenter>,
     ) {
         // if hardware_buffer is available copy stream to staging texture
         if !hardware_buffer.is_null() {
@@ -313,7 +314,7 @@ impl StreamRenderer {
                 &(view_idx as u32).to_le_bytes(),
             );
             render_pass.set_bind_group(0, &self.views_objects[view_idx].bind_group, &[]);
-            set_passthrough_push_constants(&mut render_pass, passthrough);
+            set_passthrough_push_constants(&mut render_pass, passthrough, dynamic_center, view_idx);
             render_pass.draw(0..4, 0..1);
         }
 
@@ -321,7 +322,12 @@ impl StreamRenderer {
     }
 }
 
-fn set_passthrough_push_constants(render_pass: &mut RenderPass, config: Option<&PassthroughMode>) {
+fn set_passthrough_push_constants(
+    render_pass: &mut RenderPass,
+    config: Option<&PassthroughMode>,
+    dynamic_center: Option<&alvr_packets::DynamicFoveatedCenter>,
+    view_idx: usize,
+) {
     const DEG_TO_NORM: f32 = 1. / 360.;
 
     fn set_u32(render_pass: &mut RenderPass, offset: u32, value: u32) {
@@ -422,6 +428,55 @@ fn set_passthrough_push_constants(render_pass: &mut RenderPass, config: Option<&
             );
         }
     }
+
+    // Set dynamic foveated center for Inverse-FFR
+    if let Some(center) = dynamic_center {
+        static mut DEBUG_FRAME_COUNT: u32 = 0;
+        unsafe {
+            DEBUG_FRAME_COUNT += 1;
+        }
+
+        match config {
+            None | Some(PassthroughMode::Blend { .. }) => {
+                // Use ck_channel2.zw for dynamic FFR center when chroma key is not active
+                let shift_x = center.center_shift_x;
+                let shift_y = center.center_shift_y;
+
+                // Debug logging for Inverse-FFR processing
+                unsafe {
+                    if DEBUG_FRAME_COUNT % 60 == 0 {
+                        alvr_common::debug!("CLIENT GRAPHICS: Inverse-FFR Frame {} Eye {} - shift=({:.3}, {:.3})",
+                            DEBUG_FRAME_COUNT, view_idx, shift_x, shift_y);
+                        if let Some(seq_id) = center.sequence_id {
+                            alvr_common::debug!("CLIENT GRAPHICS: Using synchronized data seq={}", seq_id);
+                        }
+                    }
+                }
+
+                set_vec4(
+                    render_pass,
+                    CK_CHANNEL2_CONST_OFFSET,
+                    Vec4::new(0.0, 0.0, shift_x, shift_y),
+                );
+            }
+            Some(PassthroughMode::RgbChromaKey(_)) | Some(PassthroughMode::HsvChromaKey(_)) => {
+                // Chroma key conflicts with Inverse-FFR functionality
+                alvr_common::warn!("CLIENT GRAPHICS: Chroma key active - Inverse-FFR disabled due to push constant conflict");
+                alvr_common::debug!("CLIENT GRAPHICS: DFR shift data available but cannot be applied due to chroma key conflict");
+
+                // TODO: Add dedicated push constants for dynamic FFR to fix this conflict
+            }
+        }
+    } else {
+        // No DFR data available - this is normal for FFR mode
+        static mut NO_DFR_DEBUG_COUNT: u32 = 0;
+        unsafe {
+            NO_DFR_DEBUG_COUNT += 1;
+            if NO_DFR_DEBUG_COUNT % 120 == 0 { // Log less frequently
+                alvr_common::debug!("CLIENT GRAPHICS: No DFR data - using static FFR (normal)");
+            }
+        }
+    }
 }
 
 pub fn foveated_encoding_shader_constants(
@@ -478,6 +533,8 @@ pub fn foveated_encoding_shader_constants(
         ("VIEW_HEIGHT_RATIO", view_ratio_aligned.y),
         ("EDGE_X_RATIO", edge_ratio.x),
         ("EDGE_Y_RATIO", edge_ratio.y),
+        ("CENTER_SIZE_X", config.center_size_x),
+        ("CENTER_SIZE_Y", config.center_size_y),
         ("C1_X", c1.x),
         ("C1_Y", c1.y),
         ("C2_X", c2.x),

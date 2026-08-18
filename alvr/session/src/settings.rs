@@ -505,6 +505,7 @@ pub struct FoveatedEncodingConfig {
     #[schema(gui(slider(min = 1.0, max = 10.0, step = 1.0)))]
     #[schema(flag = "steamvr-restart")]
     pub edge_ratio_y: f32,
+    
 }
 
 #[repr(C)]

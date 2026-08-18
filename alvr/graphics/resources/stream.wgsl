@@ -19,6 +19,9 @@ override VIEW_HEIGHT_RATIO: f32 = 0.0;
 override EDGE_X_RATIO: f32 = 0.0;
 override EDGE_Y_RATIO: f32 = 0.0;
 
+override CENTER_SIZE_X: f32 = 0.5;
+override CENTER_SIZE_Y: f32 = 0.4;
+
 override C1_X: f32 = 0.0;
 override C1_Y: f32 = 0.0;
 override C2_X: f32 = 0.0;
@@ -73,28 +76,63 @@ fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 @fragment
 fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     var corrected_uv = uv;
+
     // tell upscaler to target a lower resolution for the edges
     var upscale_source_resolution = 1.0;
     if ENABLE_FFE {
         let view_size_ratio = vec2f(VIEW_WIDTH_RATIO, VIEW_HEIGHT_RATIO);
         let edge_ratio = vec2f(EDGE_X_RATIO, EDGE_Y_RATIO);
 
-        let c1 = vec2f(C1_X, C1_Y);
-        let c2 = vec2f(C2_X, C2_Y);
-        let lo_bound = vec2f(LO_BOUND_X, LO_BOUND_Y);
-        let hi_bound = vec2f(HI_BOUND_X, HI_BOUND_Y);
+        // DFRv3: Dynamic center shift calculation
+        // Static FFR center for dual-eye convergence (hardcoded to match server)
+        let static_ffr_center = vec2f(0.4, 0.1);
 
-        let a_left = vec2f(A_LEFT_X, A_LEFT_Y);
-        let b_left = vec2f(B_LEFT_X, B_LEFT_Y);
+        // Get dynamic eyeShift from ck_channel2.zw (transmitted from server)
+        let eye_shift = pc.ck_channel2.zw;
 
-        let a_right = vec2f(A_RIGHT_X, A_RIGHT_Y);
-        let b_right = vec2f(B_RIGHT_X, B_RIGHT_Y);
-        let c_right = vec2f(C_RIGHT_X, C_RIGHT_Y);
+        // Calculate dynamic final shift
+        // Eye tracking coordinates: Y up (向上看 = positive), WGSL texture: Y down (0=top, 1=bottom)
+        // When looking up (+), FFR center should move up, which means Y decreases in texture coords
+        // So: eye up (+) -> texture center up (-), eye down (-) -> texture center down (+)
+        var dynamic_center_shift = static_ffr_center;
+        if pc.view_idx == 1u {
+            // Right eye: invert X (horizontal flip), invert Y (coord conversion)
+            dynamic_center_shift.x += -eye_shift.x;
+            dynamic_center_shift.y += -eye_shift.y;  // 向上看(+) -> center上移(-), 向下看(-) -> center下移(+)
+        } else {
+            // Left eye: X as-is, invert Y (coord conversion)
+            dynamic_center_shift.x += eye_shift.x;
+            dynamic_center_shift.y += -eye_shift.y;   // 向上看(+) -> center上移(-), 向下看(-) -> center下移(+)
+        }
 
-        if pc.view_idx == 1 {
+        // Dynamic parameter calculation (based on stream.rs logic)
+        let center_size = vec2f(CENTER_SIZE_X, CENTER_SIZE_Y);
+        let c0 = (1.0 - center_size) * 0.5;
+        let c1 = (edge_ratio - 1.0) * c0 * (dynamic_center_shift + 1.0) / edge_ratio;
+        let c2 = (edge_ratio - 1.0) * center_size + 1.0;
+
+        let lo_bound = c0 * (dynamic_center_shift + 1.0);
+        let hi_bound = c0 * (dynamic_center_shift - 1.0) + 1.0;
+        let lo_bound_c = c0 * (dynamic_center_shift + 1.0) / c2;
+        let hi_bound_c = c0 * (dynamic_center_shift - 1.0) / c2 + 1.0;
+
+        let a_left = c2 * (1.0 - edge_ratio) / (edge_ratio * lo_bound_c);
+        let b_left = (c1 + c2 * lo_bound_c) / lo_bound_c;
+
+        let a_right = c2 * (edge_ratio - 1.0) / (edge_ratio * (1.0 - hi_bound_c));
+        let b_right = (c2 - edge_ratio * c1 - 2.0 * edge_ratio * c2
+            + c2 * edge_ratio * (1.0 - hi_bound_c)
+            + edge_ratio)
+            / (edge_ratio * (1.0 - hi_bound_c));
+        let c_right = (c2 * edge_ratio - c2) * (c1 - hi_bound_c + c2 * hi_bound_c)
+            / (edge_ratio * (1.0 - hi_bound_c) * (1.0 - hi_bound_c));
+
+        // Apply original correct inverse FFR algorithm (based on stream.rs)
+        if pc.view_idx == 1u {
             corrected_uv.x = 1.0 - corrected_uv.x;
         }
 
+        // Inverse FFR transformation - restore original UV from compressed UV
         let center = (corrected_uv - c1) * edge_ratio / c2;
         let left_edge = (-b_left + sqrt(b_left * b_left + 4.0 * a_left * corrected_uv)) / (2.0 * a_left);
         let right_edge = (-b_right + sqrt(b_right * b_right - 4.0 * (c_right - a_right * corrected_uv))) / (2.0 * a_right);
@@ -121,7 +159,7 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
 
         corrected_uv = corrected_uv * view_size_ratio;
 
-        if pc.view_idx == 1 {
+        if pc.view_idx == 1u {
             corrected_uv.x = 1.0 - corrected_uv.x;
         }
     }

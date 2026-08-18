@@ -15,6 +15,7 @@ pub use logging_backend::init_logging;
 pub use tracking::HandType;
 
 use crate::connection::VideoPacket;
+use crate::tracking::eye_tracked_ffr;
 use alvr_common::{
     dbg_server_core, error,
     glam::Vec2,
@@ -27,7 +28,7 @@ use alvr_common::{
 use alvr_events::{EventType, HapticsEvent};
 use alvr_filesystem as afs;
 use alvr_packets::{
-    BatteryInfo, ButtonEntry, ClientListAction, DecoderInitializationConfig, Haptics,
+    BatteryInfo, ButtonEntry, ClientListAction, DecoderInitializationConfig, DFRShiftData, Haptics,
     VideoPacketHeader,
 };
 use alvr_server_io::ServerSessionManager;
@@ -111,6 +112,9 @@ pub struct ConnectionContext {
     clients_to_be_removed: Mutex<HashSet<String>>,
     video_channel_sender: Mutex<Option<SyncSender<VideoPacket>>>,
     haptics_sender: Mutex<Option<StreamSender<Haptics>>>,
+}
+
+impl ConnectionContext {
 }
 
 pub fn create_recording_file(connection_context: &ConnectionContext, settings: &Settings) {
@@ -414,11 +418,35 @@ impl ServerCoreContext {
                     file.write_all(&nal_buffer).ok();
                 }
 
+                // 🎯 使用统一时间戳生成器：基于SteamVR的精确targetTimestampNs检索shift数据
+                // 确保传输的shift与编码时使用的shift完全相同（同一时间戳绑定）
+                let target_timestamp_ns = target_timestamp.as_nanos() as u64;
+                let dfr_shift = eye_tracked_ffr::get_dfr_shift_for_timestamp(target_timestamp_ns).map(|shift| {
+                    let sequence_id = eye_tracked_ffr::get_synchronized_sequence_id();
+
+                    // 调试日志：验证统一时间戳绑定
+                    if shift.is_eye_tracked {
+                        alvr_common::debug!("🎯 UNIFIED_TIMESTAMP: Using cached DFR shift [seq={}, ts={}] ({:.3},{:.3}) for video packet",
+                                          sequence_id, target_timestamp_ns, shift.shift_x, shift.shift_y);
+                    } else {
+                        alvr_common::debug!("🎯 UNIFIED_TIMESTAMP: Using cached FFR default [seq={}, ts={}] for video packet",
+                                          sequence_id, target_timestamp_ns);
+                    }
+
+                    DFRShiftData {
+                        shift_x: shift.shift_x,
+                        shift_y: shift.shift_y,
+                        sequence_id,
+                        is_eye_tracked: shift.is_eye_tracked,
+                    }
+                });
+
                 if matches!(
                     sender.try_send(VideoPacket {
                         header: VideoPacketHeader {
                             timestamp: target_timestamp,
-                            is_idr
+                            is_idr,
+                            dfr_shift,  // 🎯 统一时间戳绑定的eyeshift数据
                         },
                         payload: nal_buffer,
                     }),

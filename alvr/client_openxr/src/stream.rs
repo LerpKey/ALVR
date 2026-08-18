@@ -8,6 +8,7 @@ use alvr_client_core::{
 };
 use alvr_common::{
     anyhow::Result,
+    log,
     error,
     glam::{Quat, UVec2, Vec2},
     parking_lot::RwLock,
@@ -16,7 +17,7 @@ use alvr_common::{
 use alvr_graphics::{
     compute_target_view_resolution, GraphicsContext, StreamRenderer, StreamViewParams,
 };
-use alvr_packets::{FaceData, RealTimeConfig, StreamConfig, ViewParams};
+use alvr_packets::{DFRShiftData, FaceData, RealTimeConfig, StreamConfig, ViewParams};
 use alvr_session::{
     ClientsideFoveationConfig, ClientsideFoveationMode, ClientsidePostProcessingConfig, CodecType,
     FoveatedEncodingConfig, MediacodecProperty, PassthroughMode, UpscalingConfig,
@@ -44,6 +45,7 @@ pub struct ParsedStreamConfig {
     pub clientside_foveation_config: Option<ClientsideFoveationConfig>,
     pub clientside_post_processing: Option<ClientsidePostProcessingConfig>,
     pub upscaling: Option<UpscalingConfig>,
+    pub dynamic_foveated_center: Option<alvr_packets::DynamicFoveatedCenter>,
     pub force_software_decoder: bool,
     pub max_buffering_frames: f32,
     pub buffering_history_weight: f32,
@@ -78,6 +80,7 @@ impl ParsedStreamConfig {
                 .as_option()
                 .cloned(),
             upscaling: config.settings.video.upscaling.as_option().cloned(),
+            dynamic_foveated_center: None, // Will be set via real-time config
             force_software_decoder: config.settings.video.force_software_decoder,
             max_buffering_frames: config.settings.video.max_buffering_frames,
             buffering_history_weight: config.settings.video.buffering_history_weight,
@@ -112,6 +115,9 @@ impl StreamContext {
         platform: Platform,
         config: ParsedStreamConfig,
     ) -> StreamContext {
+        // Client log connectivity test - should always appear in logs
+        log::info!(target: alvr_common::CLIENT_IMPL_DBG_LABEL, "*Client日志联通* - StreamContext创建成功，FFR配置启用状态: {}",
+            config.foveated_encoding_config.is_some());
         interaction_ctx
             .write()
             .select_sources(&config.interaction_sources);
@@ -202,6 +208,15 @@ impl StreamContext {
             config.encoding_gamma,
             config.upscaling.clone(),
         );
+
+        // Log FFR/DFR configuration status
+        if let Some(ref ffr_config) = config.foveated_encoding_config {
+            log::info!(target: alvr_common::CLIENT_GFX_DBG_LABEL, "*Client日志联通* - FFR渲染器已创建，ENABLE_FFE应为true，FFR配置: center_size=({:.2},{:.2}), edge_ratio=({:.1},{:.1})",
+                ffr_config.center_size_x, ffr_config.center_size_y,
+                ffr_config.edge_ratio_x, ffr_config.edge_ratio_y);
+        } else {
+            log::warn!(target: alvr_common::CLIENT_GFX_DBG_LABEL, "*Client日志联通* - 无FFR配置，ENABLE_FFE应为false，inverse-FFR将不工作");
+        }
 
         core_ctx.send_active_interaction_profile(
             *HAND_LEFT_ID,
@@ -330,6 +345,7 @@ impl StreamContext {
     pub fn update_real_time_config(&mut self, config: &RealTimeConfig) {
         self.config.passthrough = config.passthrough.clone();
         self.config.clientside_post_processing = config.clientside_post_processing.clone();
+        self.config.dynamic_foveated_center = config.dynamic_foveated_center.clone();
     }
 
     pub fn render(
@@ -349,7 +365,7 @@ impl StreamContext {
             }
         }
 
-        let (timestamp, view_params, buffer_ptr) =
+        let (timestamp, view_params, buffer_ptr, frame_perfect_shift) =
             if let Some((timestamp, buffer_ptr)) = frame_result {
                 let view_params = self.core_context.report_compositor_start(timestamp);
 
@@ -359,9 +375,17 @@ impl StreamContext {
 
                 self.last_good_view_params = view_params;
 
-                (timestamp, view_params, buffer_ptr)
+                // 🎯 获取Frame-Perfect绑定的shift数据：与编码时使用的shift完全相同
+                let frame_perfect_shift = self.core_context.get_frame_perfect_shift(timestamp)
+                    .map(|shift| alvr_packets::DynamicFoveatedCenter {
+                        center_shift_x: shift.shift_x,
+                        center_shift_y: shift.shift_y,
+                        sequence_id: Some(shift.sequence_id),
+                    });
+
+                (timestamp, view_params, buffer_ptr, frame_perfect_shift)
             } else {
-                (vsync_time, self.last_good_view_params, ptr::null_mut())
+                (vsync_time, self.last_good_view_params, ptr::null_mut(), None)
             };
 
         let left_swapchain_idx = self.swapchains[0].acquire_image().unwrap();
@@ -374,7 +398,55 @@ impl StreamContext {
             .wait_image(xr::Duration::INFINITE)
             .unwrap();
 
+        // 🎯 FRAME-PERFECT DEBUG: Verify Frame-Perfect vs Async data alignment
+        static mut RENDER_FRAME_COUNT: u32 = 0;
         unsafe {
+            RENDER_FRAME_COUNT += 1;
+
+            // Force log every 30 frames with println to bypass debug group filtering
+            if RENDER_FRAME_COUNT % 30 == 0 {
+                println!("=== CLIENT FRAME-PERFECT DEBUG Frame {} ===", RENDER_FRAME_COUNT);
+
+                // 🎯 显示Frame-Perfect数据（正确的）
+                if let Some(ref center) = frame_perfect_shift {
+                    let seq_info = if let Some(seq_id) = center.sequence_id {
+                        format!(" [seq={}]", seq_id)
+                    } else {
+                        " [no-seq]".to_string()
+                    };
+
+                    println!("CLIENT FRAME-PERFECT: Frame {} timestamp={:?} - DFR{} shift=({:.3},{:.3})",
+                        RENDER_FRAME_COUNT, timestamp, seq_info, center.center_shift_x, center.center_shift_y);
+
+                    log::info!(target: alvr_common::CLIENT_GFX_DBG_LABEL,
+                        "🎯 FRAME-PERFECT: Frame {} ts={:?} - DFR{} shift=({:.3},{:.3})",
+                        RENDER_FRAME_COUNT, timestamp, seq_info, center.center_shift_x, center.center_shift_y);
+                } else {
+                    println!("CLIENT FRAME-PERFECT: Frame {} timestamp={:?} - FFR mode (no Frame-Perfect DFR data)",
+                        RENDER_FRAME_COUNT, timestamp);
+
+                    log::debug!(target: alvr_common::CLIENT_GFX_DBG_LABEL,
+                        "🎯 FRAME-PERFECT: Frame {} ts={:?} - FFR mode (no Frame-Perfect DFR data)",
+                        RENDER_FRAME_COUNT, timestamp);
+                }
+
+                // 🎯 对比显示异步配置数据（有问题的旧方式）
+                if let Some(ref async_center) = self.config.dynamic_foveated_center {
+                    println!("CLIENT ASYNC-CONFIG: Frame {} - DFR shift=({:.3},{:.3}) [DEPRECATED]",
+                        RENDER_FRAME_COUNT, async_center.center_shift_x, async_center.center_shift_y);
+                } else {
+                    println!("CLIENT ASYNC-CONFIG: Frame {} - No async DFR data", RENDER_FRAME_COUNT);
+                }
+
+                // CRITICAL: Verify Frame-Perfect data is being passed to renderer
+                println!("CLIENT: About to call renderer.render() with Frame-Perfect shift: {}",
+                    if frame_perfect_shift.is_some() { "PRESENT" } else { "ABSENT" });
+            }
+        }
+
+        unsafe {
+            // 🎯 使用Frame-Perfect绑定的shift数据进行Inverse FFR
+            // 确保inverse FFR使用的shift与服务端编码时的shift完全一致
             self.renderer.render(
                 buffer_ptr,
                 [
@@ -390,6 +462,7 @@ impl StreamContext {
                     },
                 ],
                 self.config.passthrough.as_ref(),
+                frame_perfect_shift.as_ref(), // 🎯 关键修改：使用Frame-Perfect数据而非异步配置
             )
         };
 
@@ -558,18 +631,22 @@ fn stream_input_loop(
             }
         }
 
+        let eye_gazes = interaction::get_eye_gazes(
+            &xr_session,
+            &int_ctx.face_sources,
+            stage_reference_space,
+            now,
+            platform,
+        );
+        
         let face_data = FaceData {
-            eye_gazes: interaction::get_eye_gazes(
-                &xr_session,
-                &int_ctx.face_sources,
-                stage_reference_space,
-                now,
-            ),
+            eye_gazes,
             fb_face_expression: interaction::get_fb_face_expression(&int_ctx.face_sources, now).or(
                 interaction::get_pico_face_expression(&int_ctx.face_sources, now),
             ),
             htc_eye_expression: interaction::get_htc_eye_expression(&int_ctx.face_sources, now),
             htc_lip_expression: interaction::get_htc_lip_expression(&int_ctx.face_sources, now),
+            pico_eye_tracking_data: interaction::get_pico_eye_tracking_data(&int_ctx.face_sources, now),
         };
 
         if let Some((tracker, joint_count)) = &int_ctx.body_sources.body_tracker_fb {

@@ -17,7 +17,9 @@ alvr_packets.workspace = true
 alvr_session.workspace = true
 alvr_system_info.workspace = true
 
+bincode = "1"
 openxr = { git = "https://github.com/Ralith/openxrs", rev = "9270509d23dc774b43a8b7289e8adf69fcac6828" }
+serde = { version = "1", features = ["derive"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["native-activity"] }
@@ -73,6 +75,11 @@ name = "android.permission.WAKE_LOCK"
 name = "org.khronos.openxr.permission.OPENXR"
 [[package.metadata.android.uses_permission]]
 name = "org.khronos.openxr.permission.OPENXR_SYSTEM"
+# Eye tracking permissions for PICO devices
+[[package.metadata.android.uses_permission]]
+name = "com.picovr.permission.EYE_TRACKING"
+[[package.metadata.android.uses_permission]]
+name = "org.khronos.openxr.permission.EYE_TRACKING"
 
 [[package.metadata.android.queries.intent]]
 actions = ["org.khronos.openxr.OpenXRRuntimeService"]

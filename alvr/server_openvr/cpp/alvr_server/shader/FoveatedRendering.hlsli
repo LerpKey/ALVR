@@ -3,7 +3,7 @@ cbuffer FoveationVars {
 	uint2 optimizedResolution;
 	float2 eyeSizeRatio;
 	float2 centerSize;
-	float2 centerShift;
+	float2 centerShift;    // Now carries dynamic eyeShift data (static FFR center hardcoded)
 	float2 edgeRatio;
 };
 

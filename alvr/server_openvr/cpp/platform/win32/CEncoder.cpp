@@ -102,7 +102,9 @@ bool CEncoder::CopyToStaging(
     m_FrameRender->Startup();
 
     m_FrameRender->RenderFrame(
-        pTexture, bounds, poses, layerCount, recentering, message, debugText
+        pTexture, bounds, poses, layerCount, recentering,
+        m_targetTimestampNs,  // 🎯 传递SteamVR时间戳给FrameRender
+        message, debugText
     );
     return true;
 }

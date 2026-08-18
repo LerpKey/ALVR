@@ -20,7 +20,7 @@ use alvr_graphics::{
 };
 use alvr_packets::{ButtonEntry, ButtonValue, FaceData, ViewParams};
 use alvr_session::{
-    CodecType, FoveatedEncodingConfig, MediacodecPropType, MediacodecProperty, UpscalingConfig,
+    CodecType, FoveatedEncodingConfig, MediacodecPropType, MediacodecProperty, UpscalingConfig, 
 };
 use std::{
     cell::RefCell,
@@ -875,6 +875,7 @@ pub unsafe extern "C" fn alvr_render_stream_opengl(
                     },
                 ],
                 None,
+                None, // No dynamic center in C API for now
             );
         }
     });

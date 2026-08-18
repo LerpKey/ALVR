@@ -15,7 +15,7 @@ use alvr_common::{
     Pose, RelaxedAtomic, ALVR_VERSION,
 };
 use alvr_packets::{
-    ClientConnectionResult, ClientControlPacket, ClientStatistics, Haptics, RealTimeConfig,
+    ClientConnectionResult, ClientControlPacket, ClientStatistics, DFRShiftData, Haptics, RealTimeConfig,
     ServerControlPacket, StreamConfigPacket, Tracking, VideoPacketHeader,
     VideoStreamingCapabilities, ViewParams, AUDIO, HAPTICS, STATISTICS, TRACKING, VIDEO,
 };
@@ -25,7 +25,7 @@ use alvr_sockets::{
     KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT,
 };
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     sync::{mpsc, Arc},
     thread,
     time::{Duration, Instant},
@@ -71,6 +71,8 @@ pub struct ConnectionContext {
     pub uses_multimodal_protocol: RelaxedAtomic,
     pub velocities_multiplier: RwLock<f32>,
     pub max_prediction: RwLock<Duration>,
+    // 🎯 Frame-Perfect shift数据缓存：确保每帧视频使用对应的shift数据
+    pub frame_shift_cache: RwLock<BTreeMap<Duration, Option<DFRShiftData>>>,
 }
 
 fn set_hud_message(event_queue: &Mutex<VecDeque<ClientCoreEvent>>, message: &str) {
@@ -302,6 +304,33 @@ fn connection_pipeline(
 
                 if let Some(stats) = &mut *ctx.statistics_manager.lock() {
                     stats.report_video_packet_received(header.timestamp);
+                }
+
+                // 🎯 Frame-Perfect shift数据缓存：存储来自服务端统一时间戳绑定的shift数据
+                if let Some(dfr_shift) = header.dfr_shift {
+                    let mut cache_guard = ctx.frame_shift_cache.write();
+                    cache_guard.insert(header.timestamp, Some(dfr_shift));
+
+                    // 清理过期数据，防止内存无限增长（保留最近100帧）
+                    if cache_guard.len() > 100 {
+                        let oldest_keys: Vec<Duration> = cache_guard.keys().take(50).cloned().collect();
+                        for key in oldest_keys {
+                            cache_guard.remove(&key);
+                        }
+                    }
+
+                    // 调试日志：验证Frame-Perfect数据接收
+                    if dfr_shift.is_eye_tracked {
+                        alvr_common::debug!("🎯 CLIENT_FRAME_PERFECT: Cached DFR shift [ts={:?}, seq={}] ({:.3},{:.3})",
+                                          header.timestamp, dfr_shift.sequence_id, dfr_shift.shift_x, dfr_shift.shift_y);
+                    } else {
+                        alvr_common::debug!("🎯 CLIENT_FRAME_PERFECT: Cached FFR default [ts={:?}, seq={}]",
+                                          header.timestamp, dfr_shift.sequence_id);
+                    }
+                } else {
+                    // 没有shift数据时也要记录，用于FFR模式
+                    let mut cache_guard = ctx.frame_shift_cache.write();
+                    cache_guard.insert(header.timestamp, None);
                 }
 
                 if header.is_idr {

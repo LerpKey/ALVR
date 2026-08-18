@@ -4,7 +4,7 @@ use crate::{
     input_mapping::ButtonMappingManager,
     sockets::WelcomeSocket,
     statistics::StatisticsManager,
-    tracking::{self, TrackingManager},
+    tracking::{self, eye_tracked_ffr, TrackingManager},
     ConnectionContext, ServerCoreEvent, ViewsConfig, FILESYSTEM_LAYOUT, SESSION_MANAGER,
 };
 use alvr_adb::{WiredConnection, WiredConnectionStatus};
@@ -20,8 +20,8 @@ use alvr_common::{
 use alvr_events::{AdbEvent, ButtonEvent, EventType};
 use alvr_packets::{
     ClientConnectionResult, ClientControlPacket, ClientListAction, ClientStatistics,
-    NegotiatedStreamingConfig, RealTimeConfig, ReservedClientControlPacket, ServerControlPacket,
-    Tracking, VideoPacketHeader, AUDIO, HAPTICS, STATISTICS, TRACKING, VIDEO,
+    DynamicFoveatedCenter, NegotiatedStreamingConfig, RealTimeConfig, ReservedClientControlPacket,
+    ServerControlPacket, Tracking, VideoPacketHeader, AUDIO, HAPTICS, STATISTICS, TRACKING, VIDEO,
 };
 use alvr_session::{
     BodyTrackingBDConfig, BodyTrackingSinkConfig, CodecType, ControllersEmulationMode, FrameSize,
@@ -43,7 +43,7 @@ use std::{
 const RETRY_CONNECT_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const HANDSHAKE_ACTION_TIMEOUT: Duration = Duration::from_secs(2);
 pub const STREAMING_RECV_TIMEOUT: Duration = Duration::from_millis(500);
-const REAL_TIME_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+const REAL_TIME_UPDATE_INTERVAL: Duration = Duration::from_millis(33); // ~30Hz for real-time DFR
 
 const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
 
@@ -1085,12 +1085,23 @@ fn connection_pipeline(
         let client_hostname = client_hostname.clone();
         move || {
             while is_streaming(&client_hostname) {
-                let config = {
+                let mut config = {
                     let session_manager_lock = SESSION_MANAGER.read();
                     let settings = session_manager_lock.settings();
 
                     RealTimeConfig::from_settings(settings)
                 };
+
+                // Add synchronized dynamic foveated center for pipeline consistency
+                // This ensures server encoding and client inverse-FFR use identical shift values
+                if let Some(sync_dfr_shift) = eye_tracked_ffr::get_synchronized_dfr_shift() {
+                    config.dynamic_foveated_center = Some(DynamicFoveatedCenter {
+                        center_shift_x: sync_dfr_shift.shift_x,
+                        center_shift_y: sync_dfr_shift.shift_y,
+                        sequence_id: Some(eye_tracked_ffr::get_synchronized_sequence_id()),
+                    });
+                }
+                // NOTE: Use synchronized data to ensure server encoding and client inverse-FFR alignment
 
                 if let Ok(config) = config.encode() {
                     control_sender.lock().send(&config).ok();

@@ -28,6 +28,17 @@ Release
 
 release-files/
 
+# Experiment data backups (Ch5 experiments, not source-controlled)
+databackup/
+
+# Claude Code temporary working dirs
+tmpclaude-*/
+tmpclaude-*
+
+# Local debug figures dropped at repo root during analysis
+/fig[0-9]*_*.png
+alvr_telemetry_analysis.ipynb
+
 # Ignore generated file with harvested file paths for WiX
 wix/harvested.wxs
 
@@ -73,3 +84,12 @@ CMakeLists.txt
 cmake-build-debug/
 
 *.jks
+
+saved/
+.history/
+.memory-bank/
+
+AGENTS.md 
+CLAUDE.md 
+GEMINI.md 
+__archive/

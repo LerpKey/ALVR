@@ -445,6 +445,8 @@ bool FrameRender::Startup() {
 
         m_pStagingTexture = m_ffr->GetOutputTexture();
     }
+    //如果开启EFR(Eye-tracked Foveated Rendering)
+    //在这里定义类似m_ffr的m_efr，即FoveatedRendering
 
     if (Settings::Instance().m_enableHdr) {
         std::vector<uint8_t> yuv420ShaderCSO(
@@ -567,6 +569,7 @@ bool FrameRender::RenderFrame(
     vr::HmdMatrix34_t poses[],
     int layerCount,
     bool recentering,
+    uint64_t targetTimestampNs,  // 🎯 新增: SteamVR时间戳用于统一时间戳生成器
     const std::string& message,
     const std::string& debugText
 ) {
@@ -878,6 +881,9 @@ bool FrameRender::RenderFrame(
     }
 
     if (enableFFE) {
+        // 🎯 DFR: Update foveation parameters using SteamVR's exact timestamp
+        // 确保FFR使用与video encoding完全相同的targetTimestampNs
+        m_ffr->UpdateFoveationParams(targetTimestampNs);
         m_ffr->Render();
     }
 

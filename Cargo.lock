@@ -255,10 +255,12 @@ dependencies = [
  "alvr_session",
  "alvr_system_info",
  "android-activity",
+ "bincode",
  "jni",
  "libc",
  "ndk-context",
  "openxr",
+ "serde",
 ]
 
 [[package]]
@@ -334,6 +336,7 @@ name = "alvr_graphics"
 version = "21.0.0-dev01"
 dependencies = [
  "alvr_common",
+ "alvr_packets",
  "alvr_session",
  "glow",
  "glyph_brush_layout",

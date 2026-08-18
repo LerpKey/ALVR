@@ -57,6 +57,7 @@ public:
         vr::HmdMatrix34_t poses[],
         int layerCount,
         bool recentering,
+        uint64_t targetTimestampNs,  // 🎯 新增: SteamVR时间戳用于统一时间戳生成器
         const std::string& message,
         const std::string& debugText
     );

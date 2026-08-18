@@ -13,7 +13,7 @@ use crate::{
 };
 use alvr_common::{
     glam::{Quat, Vec3},
-    *,
+    warn, *,
 };
 use alvr_packets::{ButtonEntry, ButtonValue, StreamConfig, ViewParams};
 use alvr_session::{BodyTrackingBDConfig, BodyTrackingSourcesConfig, FaceTrackingSourcesConfig};
@@ -344,13 +344,10 @@ impl InteractionContext {
             )
             .unwrap();
 
-        // Pico headsets require calling get_system_properties to test for extensions, because all
-        // extensions function pointers are available even if the feature is not supported by the
-        // hardware. The full checks are done in supports_eye_gaze_interaction. This is required
-        // to avoid a crash when requesting the EYE_TRACKING permission.
-        let combined_eyes_source = if !platform.is_quest()
-            && !platform.is_vive()
-            && extra_extensions::supports_eye_gaze_interaction(&xr_session, xr_system)
+        // Enable eye gaze interaction for all platforms that support it
+        // PICO devices need this for proper eye tracking functionality
+        let combined_eyes_source = if extra_extensions::supports_eye_gaze_interaction(&xr_session, xr_system)
+            || platform.is_pico()  // Force enable for PICO even if standard check fails
         {
             // todo: research Pico Neo 3 Pro Eye platform detection
             #[cfg(target_os = "android")]
@@ -371,8 +368,11 @@ impl InteractionContext {
                     .unwrap(),
                 &[binding(&action, "/user/eyes_ext/input/gaze_ext/pose")],
             );
-            if res.is_err() {
-                warn!("Failed to register combined eye gaze input: {res:?}");
+            if res.is_ok() {
+                alvr_common::info!("Successfully registered Eye Gaze Interaction Profile");
+            } else {
+                alvr_common::warn!("Failed to register Eye Gaze Interaction Profile: {res:?}");
+                alvr_common::warn!("This may cause eye tracking data to be unavailable");
             }
 
             let space = action
@@ -504,7 +504,8 @@ impl InteractionContext {
                 #[cfg(target_os = "android")]
                 {
                     alvr_system_info::try_get_permission("android.permission.RECORD_AUDIO");
-                    alvr_system_info::try_get_permission("com.picovr.permission.FACE_TRACKING")
+                    alvr_system_info::try_get_permission("com.picovr.permission.FACE_TRACKING");
+                    alvr_system_info::try_get_permission("com.picovr.permission.EYE_TRACKING")
                 }
             }
         }
@@ -614,7 +615,9 @@ impl InteractionContext {
         }
 
         if let Some(face_tracker) = &self.face_sources.face_tracker_pico {
+            // Start both face and eye tracking
             face_tracker.start_face_tracking().ok();
+            face_tracker.start_eye_tracking().ok();
         }
     }
 }
@@ -899,9 +902,11 @@ pub fn get_eye_gazes(
     sources: &FaceSources,
     reference_space: &xr::Space,
     time: Duration,
+    platform: Platform,
 ) -> [Option<Pose>; 2] {
     let xr_time = crate::to_xr_time(time);
 
+    // Try FB eye tracker first (Quest Pro)
     'fb_eyes: {
         let Some(tracker) = &sources.eye_tracker_fb else {
             break 'fb_eyes;
@@ -915,6 +920,25 @@ pub fn get_eye_gazes(
         }
     };
 
+    // PICO eye tracking - use eye_tracker method for accurate data
+    'pico_eyes: {
+        // Only attempt PICO eye tracking on supported PICO 4 devices
+        if !matches!(platform, Platform::Pico4 | Platform::Pico4Pro | Platform::Pico4Enterprise) {
+            break 'pico_eyes;
+        }
+
+        let Some(face_tracker) = &sources.face_tracker_pico else {
+            // Face tracker not available - this is normal for non-PICO or unsupported devices
+            break 'pico_eyes;
+        };
+
+        // Use eye_tracker method only for accurate eye tracking data
+        if let Some(gaze_poses) = get_pico_eye_gazes_from_eye_tracker(face_tracker, xr_time) {
+            return gaze_poses;
+        }
+    };
+
+    // Fallback to combined eye source (OpenXR standard)
     let Some((eyes_action, eyes_space)) = &sources.combined_eyes_source else {
         return [None, None];
     };
@@ -938,6 +962,114 @@ pub fn get_eye_gazes(
     }
 }
 
+fn get_pico_eye_gazes_from_eye_tracker(
+    face_tracker: &FaceTrackerPico,
+    xr_time: openxr::Time,
+) -> Option<[Option<Pose>; 2]> {
+    // Get eye tracking data from PICO tracker with proper error handling
+    let eye_data = match face_tracker.get_eye_tracking_data(xr_time) {
+        Ok(Some(data)) => data,
+        Ok(None) => {
+            // No eye tracking data available - this is normal
+            return None;
+        }
+        Err(e) => {
+            warn!("Failed to get PICO eye tracking data: {:?}", e);
+            return None;
+        }
+    };
+
+    // Validate eye pose status for both eyes
+    let left_valid = alvr_packets::eye_pose_status_pico::is_gaze_point_valid(eye_data.left_eye_pose_status)
+                     && alvr_packets::eye_pose_status_pico::is_gaze_vector_valid(eye_data.left_eye_pose_status);
+    let right_valid = alvr_packets::eye_pose_status_pico::is_gaze_point_valid(eye_data.right_eye_pose_status)
+                      && alvr_packets::eye_pose_status_pico::is_gaze_vector_valid(eye_data.right_eye_pose_status);
+
+    let left_pose = if left_valid {
+        // Convert gaze vector to orientation quaternion
+        let gaze_vector = Vec3::new(
+            eye_data.left_eye_gaze_vector[0],
+            eye_data.left_eye_gaze_vector[1], 
+            eye_data.left_eye_gaze_vector[2],
+        );
+        
+        // Validate gaze vector before processing
+        if !gaze_vector.is_finite() {
+            warn!("Invalid left eye gaze vector: {:?}", gaze_vector);
+            return None;
+        }
+        
+        // Use eye position guide if available, otherwise default to zero
+        let eye_position = Vec3::new(
+            eye_data.left_eye_position_guide[0],
+            eye_data.left_eye_position_guide[1],
+            eye_data.left_eye_position_guide[2],
+        );
+
+        // Create orientation from gaze vector (direction vector → quaternion rotation)
+        // PICO gaze vectors are in OpenXR coordinate system: +X right, +Y up, +Z backward
+        // OpenXR forward direction is -Z, which matches our reference
+        let forward = -Vec3::Z;
+        let orientation = if gaze_vector.length_squared() > 1e-6 {
+            // This is the correct algorithm: from_rotation_arc calculates the shortest rotation
+            // between two direction vectors, which is exactly what we need for gaze direction
+            Quat::from_rotation_arc(forward, gaze_vector.normalize())
+        } else {
+            Quat::IDENTITY
+        };
+
+        Some(Pose {
+            position: eye_position,
+            orientation,
+        })
+    } else {
+        None
+    };
+
+    let right_pose = if right_valid {
+        // Convert gaze vector to orientation quaternion
+        let gaze_vector = Vec3::new(
+            eye_data.right_eye_gaze_vector[0],
+            eye_data.right_eye_gaze_vector[1],
+            eye_data.right_eye_gaze_vector[2],
+        );
+        
+        // Validate gaze vector before processing
+        if !gaze_vector.is_finite() {
+            warn!("Invalid right eye gaze vector: {:?}", gaze_vector);
+            return None;
+        }
+        
+        // Use eye position guide if available, otherwise default to zero
+        let eye_position = Vec3::new(
+            eye_data.right_eye_position_guide[0],
+            eye_data.right_eye_position_guide[1],
+            eye_data.right_eye_position_guide[2],
+        );
+
+        // Create orientation from gaze vector (direction vector → quaternion rotation)
+        // PICO gaze vectors are in OpenXR coordinate system: +X right, +Y up, +Z backward
+        // OpenXR forward direction is -Z, which matches our reference
+        let forward = -Vec3::Z;
+        let orientation = if gaze_vector.length_squared() > 1e-6 {
+            // This is the correct algorithm: from_rotation_arc calculates the shortest rotation
+            // between two direction vectors, which is exactly what we need for gaze direction
+            Quat::from_rotation_arc(forward, gaze_vector.normalize())
+        } else {
+            Quat::IDENTITY
+        };
+
+        Some(Pose {
+            position: eye_position,
+            orientation,
+        })
+    } else {
+        None
+    };
+
+    Some([left_pose, right_pose])
+}
+
 pub fn get_fb_face_expression(context: &FaceSources, time: Duration) -> Option<Vec<f32>> {
     let xr_time = crate::to_xr_time(time);
 
@@ -956,6 +1088,33 @@ pub fn get_pico_face_expression(context: &FaceSources, time: Duration) -> Option
         .as_ref()
         .and_then(|t| t.get_face_tracking_data(xr_time).ok().flatten())
         .map(|weights| weights.into_iter().collect())
+}
+
+pub fn get_pico_eye_tracking_data(context: &FaceSources, time: Duration) -> Option<alvr_packets::EyeTrackingDataPICO> {
+    let xr_time = crate::to_xr_time(time);
+
+    // Add diagnostic logging for PICO eye tracking
+    if context.face_tracker_pico.is_none() {
+        alvr_common::warn!("PICO eye tracker not initialized - check permissions and device capabilities");
+        return None;
+    }
+
+    let result = context
+        .face_tracker_pico
+        .as_ref()
+        .and_then(|t| t.get_eye_tracking_data(xr_time).ok().flatten());
+
+    match &result {
+        Some(data) => {
+            alvr_common::debug!("PICO eye data retrieved - time: {}, status: {:012b}",
+                               data.time, data.combined_eye_pose_status);
+        }
+        None => {
+            alvr_common::debug!("PICO eye tracking API returned no data");
+        }
+    }
+
+    result
 }
 
 pub fn get_htc_eye_expression(context: &FaceSources, time: Duration) -> Option<Vec<f32>> {

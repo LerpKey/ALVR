@@ -133,6 +133,13 @@ _CreateBuffer(ID3D11Device* device, const void* bufferData, size_t bufferSize, D
     bufferDesc.ByteWidth = (UINT)bufferSize;
     bufferDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     bufferDesc.StructureByteStride = 0;
+    
+    // Critical fix: Dynamic buffers require CPU write access
+    if (usage == D3D11_USAGE_DYNAMIC) {
+        bufferDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    } else {
+        bufferDesc.CPUAccessFlags = 0;
+    }
 
     D3D11_SUBRESOURCE_DATA dataDesc = { 0 };
     dataDesc.pSysMem = bufferData;

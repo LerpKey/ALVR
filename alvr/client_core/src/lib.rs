@@ -25,7 +25,7 @@ use alvr_common::{
     HEAD_ID,
 };
 use alvr_packets::{
-    BatteryInfo, ButtonEntry, ClientControlPacket, FaceData, RealTimeConfig,
+    BatteryInfo, ButtonEntry, ClientControlPacket, DFRShiftData, FaceData, RealTimeConfig,
     ReservedClientControlPacket, StreamConfig, Tracking, ViewParams, ViewsConfig,
 };
 use alvr_session::CodecType;
@@ -394,6 +394,36 @@ impl ClientCoreContext {
                 }
             }
         }
+    }
+
+    /// 🎯 获取Frame-Perfect绑定的shift数据
+    /// 基于视频帧的timestamp精确检索对应的shift数据
+    /// 确保inverse FFR使用的shift与服务端FR时的shift完全一致
+    pub fn get_frame_perfect_shift(&self, timestamp: Duration) -> Option<DFRShiftData> {
+        let cache_guard = self.connection_context.frame_shift_cache.read();
+        if let Some(cached_data) = cache_guard.get(&timestamp) {
+            if let Some(shift_data) = cached_data {
+                alvr_common::debug!("🎯 CLIENT_FRAME_PERFECT: Retrieved DFR shift [ts={:?}, seq={}] ({:.3},{:.3})",
+                                  timestamp, shift_data.sequence_id, shift_data.shift_x, shift_data.shift_y);
+                return Some(*shift_data);
+            } else {
+                alvr_common::debug!("🎯 CLIENT_FRAME_PERFECT: Using FFR mode [ts={:?}]", timestamp);
+                return None;
+            }
+        } else {
+            alvr_common::warn!("🎯 CLIENT_FRAME_PERFECT: No shift data found for timestamp {:?}, cache size: {}",
+                             timestamp, cache_guard.len());
+        }
+        None
+    }
+
+    /// 🎯 检查Frame-Perfect缓存状态（调试用）
+    pub fn get_frame_shift_cache_info(&self) -> (usize, Option<Duration>, Option<Duration>) {
+        let cache_guard = self.connection_context.frame_shift_cache.read();
+        let size = cache_guard.len();
+        let oldest = cache_guard.keys().next().cloned();
+        let newest = cache_guard.keys().next_back().cloned();
+        (size, oldest, newest)
     }
 }
 
