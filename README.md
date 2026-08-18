@@ -1,8 +1,22 @@
-# ALVR — Dynamic Foveated Rendering Fork
+# PICO 4 Enterprise Eye-Tracked Dynamic Foveated Rendering for ALVR
 
-This repository is an experimental fork of [ALVR](https://github.com/alvr-org/ALVR), focused primarily on eye-tracked dynamic foveated rendering (DFR).
+An experimental [ALVR](https://github.com/alvr-org/ALVR) fork for **gaze-contingent dynamic foveated rendering (DFR)** on the **PICO 4 Enterprise (PICO 4E) eye-tracking headset**. The implementation moves the high-quality foveal region with the user's gaze instead of keeping it fixed at the image center.
+
+This project targets the eye-tracking PICO 4E configuration specifically. Standard PICO 4 models and other headsets are not validated for the eye-tracked DFR path. When valid eye input is unavailable, the implementation can fall back to fixed foveated rendering.
 
 It is not a current upstream ALVR release and should not be expected to be compatible with the latest upstream code or headset runtimes.
+
+## What this project provides
+
+- PICO 4E eye-gaze acquisition through the Android OpenXR client.
+- Per-eye gaze data transport from the headset to the ALVR streamer.
+- Gaze-contingent server-side foveated encoding with a moving foveal region.
+- Client-side inverse foveation to reconstruct the streamed image.
+- Explicit `Unsupported`, `Standby`, and `Active` eye-tracking states.
+- Fixed foveation fallback when active eye input is unavailable.
+- Optional telemetry for eye tracking, pose, encoding, and network measurements.
+
+This is a reference implementation for people looking for an ALVR-compatible PICO 4E DFR starting point. It is not a maintained production release and has not been validated against current upstream ALVR versions.
 
 ## Fork provenance
 
@@ -33,19 +47,23 @@ The main implementation areas are:
 - `alvr/server_openvr/cpp/platform/win32/FFR.cpp` — server-side foveated encoding parameters.
 - `alvr/graphics/resources/stream.wgsl` — client-side inverse foveation and frame rendering.
 
-The branch also contains exploratory telemetry and motion-prediction work from later experiments. Those changes are retained in the history, but they are not presented as production-ready or actively maintained features.
+The branch also contains telemetry and motion-prediction additions. Those changes are not presented as production-ready or actively maintained features.
+
+## Hardware and experiment profile
+
+The eye-tracking development and the available logs are centered on **PICO 4 Enterprise (PICO 4E)**. The target desktop path is Windows with SteamVR, the Windows OpenVR driver, NVIDIA hardware encoding through NVENC, and the Direct3D 11 server renderer. The exact PC CPU, GPU model, memory, router model, PICO firmware version, and OpenXR runtime version were not recorded in the development logs; this repository does not claim those details.
+
+The recommended experiment network uses a 5 GHz wireless connection for the headset and Ethernet for the streamer PC on the same local network. The exact network hardware and measured bandwidth are not part of the recorded baseline.
 
 ## Status and limitations
 
-This is a reference implementation and an invitation for further development. The original developer currently has no VR headset available for continued hardware validation or maintenance. Porting the DFR changes to a current upstream ALVR revision, validating them on modern headsets, and preparing an upstream contribution will require community help.
+This is a reference implementation and an invitation for further development. Historical validation was centered on PICO 4E, but this repository does not claim ongoing hardware validation or broad headset compatibility. Porting the DFR changes to a current upstream ALVR revision, validating them on modern headsets, and preparing an upstream contribution will require community help.
 
 Use this repository to inspect the implementation, reproduce the development direction, or extract individual ideas for upstream integration. Expect substantial work when adapting it to current ALVR APIs, protocols, graphics code, and headset runtimes.
 
 ## Building
 
 The minimum Rust version is 1.82. Windows builds require the MSVC C++ toolchain and Windows SDK. Android builds additionally require Java 17, Android SDK platform 32, Android NDK r26, and the `aarch64-linux-android` Rust target.
-
-The server core's BCMP predictor requires libtorch 2.4.0 when that feature is enabled. Set `LIBTORCH` to the libtorch installation before building.
 
 From the repository root:
 
