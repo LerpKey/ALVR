@@ -1,5 +1,7 @@
 # PICO 4 Enterprise Eye-Tracked Dynamic Foveated Rendering for ALVR
 
+> Hardware scope: this project is specifically for the eye-tracking version of **PICO 4 Enterprise (PICO 4E)**. It is not a general-purpose DFR implementation for every PICO or VR headset.
+
 An experimental [ALVR](https://github.com/alvr-org/ALVR) fork for **gaze-contingent dynamic foveated rendering (DFR)** on the **PICO 4 Enterprise (PICO 4E) eye-tracking headset**. The implementation moves the high-quality foveal region with the user's gaze instead of keeping it fixed at the image center.
 
 This project targets the eye-tracking PICO 4E configuration specifically. Standard PICO 4 models and other headsets are not validated for the eye-tracked DFR path. When valid eye input is unavailable, the implementation can fall back to fixed foveated rendering.
@@ -49,9 +51,16 @@ The main implementation areas are:
 
 The branch also contains telemetry and motion-prediction additions. Those changes are not presented as production-ready or actively maintained features.
 
-## Hardware and experiment profile
+## Hardware support: PICO 4 Enterprise (PICO 4E)
 
-The eye-tracking development and the available logs are centered on **PICO 4 Enterprise (PICO 4E)**. The target desktop path is Windows with SteamVR, the Windows OpenVR driver, NVIDIA hardware encoding through NVENC, and the Direct3D 11 server renderer. The exact PC CPU, GPU model, memory, router model, PICO firmware version, and OpenXR runtime version were not recorded in the development logs; this repository does not claim those details.
+The eye-tracking DFR path requires all of the following:
+
+- A **PICO 4 Enterprise (PICO 4E)** headset with functioning eye-tracking hardware.
+- Eye-tracking permissions enabled on the headset.
+- An OpenXR runtime that exposes PICO 4E gaze input to the client.
+- A Windows streamer using SteamVR, the Windows OpenVR driver, NVIDIA NVENC, and the Direct3D 11 server renderer for the historical target path.
+
+Standard PICO 4 models, PICO 4 Ultra, and other headsets are not validated for this eye-tracked DFR implementation. If valid eye input is unavailable, the code can fall back to fixed foveated rendering; that fallback is not gaze-contingent DFR.
 
 The recommended experiment network uses a 5 GHz wireless connection for the headset and Ethernet for the streamer PC on the same local network. The exact network hardware and measured bandwidth are not part of the recorded baseline.
 
